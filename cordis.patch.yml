@@ -1,0 +1,18 @@
+# dsh-session-readcache — advisory cold-session read cache.
+# Mounts a late row; apply(ctx, config) wraps the shared sessionPersistence
+# instance's inspect()/list() (see lib/index.js). All knobs optional; defaults
+# in lib/index.js: maxEntries 24, maxTotalEvents 250000, listTtlMs 750.
+# Set enabled: false to neutralize the row without uninstalling.
+- insert:
+    - id: session-readcache
+      name: dsh-session-readcache
+      config:
+        maxEntries: 24
+        maxTotalEvents: 250000
+        listTtlMs: 750
+        # A real list() scan measures ~9.7s for 3.8k logs here, so a strict TTL
+        # expires before any caller can be served. Inside this window the last
+        # scan is returned immediately while a refresh runs behind it.
+        listMaxStaleMs: 30000
+        # Boot seeding: reuse the persisted snapshot if it is younger than this.
+        snapshotMaxAgeMs: 600000

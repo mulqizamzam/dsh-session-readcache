@@ -1,0 +1,16 @@
+# Investigation artifacts and baseline snapshots — not source.
+artifacts/
+.snapshots/
+node_modules/
+# Throwaway DSH_HOME built by artifacts/verify-livehost.mjs (gone after a clean
+# run, left behind when one is interrupted).
+.probe/
+# Local npm cache + node-gyp headers: $HOME is read-only in this sandbox, so
+# installs must target a writable cache inside the workspace instead.
+.npm-cache/
+# Vendored copy of the better-sqlite3 native module (27M incl. compiled
+# build/). Resolved by pnpm from the lockfile; committing it would put a
+# platform-specific binary in the baseline.
+better-sqlite3/
+# Local copy of package.json kept as a rollback aid during dependency edits.
+package.json.backup
