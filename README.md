@@ -52,11 +52,15 @@ Istilah yang perlu diketahui sebelum lanjut:
 Yang ditambahkan plugin, semuanya dari `lib/index.js`:
 
 - Cache `inspect` dengan kapasitas lebih besar dari cache bawaan host, divalidasi
-  dengan satu `stat` per hit. Sumber nilai default: `lib/index.js:12-26`.
+  dengan satu `stat` per hit. Sumber nilai default: `lib/index.js:20-34`.
 - Memo `list` ber-TTL pendek dengan penggabungan permintaan (_coalescing_) yang
   sedang berjalan.
 - Jendela stale untuk `list`, supaya pemanggil tidak menunggu scan yang memakan
   detik-detik.
+- Invalidasi saat **sesi dibuang** (`session/disposed`): entri cache dijatahkan
+  sebelum host selesai menulis event terakhir sesi itu, sehingga plugin tidak
+  pernah mengembalikan view yang host sendiri tidak akan kembalikan
+  (`lib/index.js:661-675`).
 - Snapshot SQLite dari scan terakhir, supaya restart tidak membayar scan penuh
   untuk reply pertamanya.
 - Dua endpoint HTTP pada web server host untuk melihat penghitung (_metrics_) dan
@@ -129,7 +133,7 @@ sampai restart. Restart web server adalah tindakan pemilik host.
 
 Tidak ada file `.env.example` di repo ini. Satu-satunya environment variable yang
 dibaca oleh kode adalah `DSH_HOME`, dipakai hanya sebagai fallback untuk menentukan
-lokasi file snapshot (`lib/index.js:313-316`). Kalau host sudah menyediakan service
+lokasi file snapshot (`lib/index.js:860-473`). Kalau host sudah menyediakan service
 `dshHomePath`, variabel ini tidak dipakai. Lihat bagian 5.
 
 ### 3.4 Perintah pembuktian bahwa instalasi berhasil
@@ -196,17 +200,17 @@ Tidak ada file konfigurasi terpisah. Konfigurasi datang dari baris plugin di
 `package.json` mendaftarkan `cordis.patch.yml` sebagai patch bundle.
 
 Semua kunci opsional. Nilai di bawah adalah default yang tertera di
-`lib/index.js:12-26`, dan nilai yang sama ditulis ulang di `cordis.patch.yml`.
+`lib/index.js:20-34`, dan nilai yang sama ditulis ulang di `cordis.patch.yml`.
 
 | Kunci | Default | Fungsi | Boleh 0? |
 | --- | --- | --- | --- |
-| `enabled` | `true` | `false` menonaktifkan plugin tanpa uninstall: `apply()` langsung keluar dan tidak membungkus apa pun (`lib/index.js:133-136`) | tidak, nilai selain `false` diperlakukan aktif |
-| `maxEntries` | `24` | Kapasitas LRU cache `inspect` | tidak, nilai bukan positive integer akan jatuh ke default (`lib/index.js:137`) |
-| `maxTotalEvents` | `250000` | Total anggaran event terparse untuk seluruh entri cache | tidak, lihat `lib/index.js:138` |
-| `listTtlMs` | `750` | Selama jendela ini hasil scan `list()` dianggap segar dan dilayani sebagai hit | ya, `0` membuat memo selalu basi (`lib/index.js:139`) |
-| `listMaxStaleMs` | `30000` | Setelah TTL habis tapi masih di dalam jendela ini, hasil scan terakhir dikembalikan sambil refresh berjalan di belakang | ya, `0` mempertahankan perilaku TTL ketat (`lib/index.js:140`) |
-| `snapshotMaxAgeMs` | `600000` | Umur maksimum snapshot yang boleh mengisi memo saat boot | ya, `0` mematikan boot seeding (`lib/index.js:141`) |
-| `snapshotPath` | diturunkan | Lokasi file snapshot SQLite secara eksplisit | string kosong berarti pakai turunan (`lib/index.js:305-307`) |
+| `enabled` | `true` | `false` menonaktifkan plugin tanpa uninstall: `apply()` langsung keluar dan tidak membungkus apa pun (`lib/index.js:235-238`) | tidak, nilai selain `false` diperlakukan aktif |
+| `maxEntries` | `24` | Kapasitas LRU cache `inspect` | tidak, nilai bukan positive integer akan jatuh ke default (`lib/index.js:53-60`) |
+| `maxTotalEvents` | `250000` | Total anggaran event terparse untuk seluruh entri cache | tidak, lihat `lib/index.js:53-60` |
+| `listTtlMs` | `750` | Selama jendela ini hasil scan `list()` dianggap segar dan dilayani sebagai hit | ya, `0` membuat memo selalu basi (`lib/index.js:53-60`) |
+| `listMaxStaleMs` | `30000` | Setelah TTL habis tapi masih di dalam jendela ini, hasil scan terakhir dikembalikan sambil refresh berjalan di belakang | ya, `0` mempertahankan perilaku TTL ketat (`lib/index.js:53-60`) |
+| `snapshotMaxAgeMs` | `600000` | Umur maksimum snapshot yang boleh mengisi memo saat boot | ya, `0` mematikan boot seeding (`lib/index.js:53-60`) |
+| `snapshotPath` | diturunkan | Lokasi file snapshot SQLite secara eksplisit | string kosong berarti pakai turunan (`lib/index.js:462-464`) |
 
 Contoh bentuk konfigurasi, diambil dari `cordis.patch.yml`:
 
@@ -224,9 +228,30 @@ Contoh bentuk konfigurasi, diambil dari `cordis.patch.yml`:
 
 Semua nilai di atas adalah nilai yang benar-benar ada di file, bukan placeholder.
 Kalau Anda mengubahnya, pastikan tetap bilangan bulat. Nilai yang bukan bilangan
-bulat atau negatif akan diabaikan dan default yang dipakai, kecuali pada
-`listTtlMs`, `listMaxStaleMs`, dan `snapshotMaxAgeMs` yang menerima `0` sebagai
-nilai bermakna (`lib/index.js:28-34`).
+bulat, negatif (untuk kunci yang tidak menerima `0`), atau di luar rentang safe
+integer akan diabaikan dan default yang dipakai, kecuali pada `listTtlMs`,
+`listMaxStaleMs`, dan `snapshotMaxAgeMs` yang menerima `0` sebagai nilai bermakna
+(`lib/index.js:48-54`). Yang berubah: nilai tidak valid **tidak lagi jatuh ke
+default tanpa jejak**. Setiap kunci yang ditolak dinamakan di log host saat mount,
+dengan bentuk `[session-readcache] invalid config, default used: maxEntries="8"`
+(`lib/index.js:245-261`). Begitu pula `enabled` yang bukan boolean: hanya nilai
+`false` persis yang mematikan plugin, dan nilai lain memicu peringatan
+(`lib/index.js:240-243`).
+
+### 4.1 Waktu: TTL memakai jam monotonik
+
+`listTtlMs`, `listMaxStaleMs`, dan umur memo `list()` dihitung dari **jam
+monotonik** (`performance.now()`), bukan `Date.now()` (`lib/index.js:36-48`).
+Alasannya: langkah jam dinding (koreksi NTP, jam manual) tidak boleh bisa
+memperpanjang hidup memo atau membuatnya abadi. Konsekuensi jujur: batas waktu
+ini hanya bermakna di dalam satu proses, dan itu memang ruang lingkupnya.
+
+Snapshot adalah pengecualian yang disengaja. `saved_at` dan pemeriksaan
+`snapshotMaxAgeMs` tetap memakai **jam dinding**, karena nilainya ditulis ke disk
+dan dibaca kembali oleh proses lain di mana waktu monotonik tidak berarti apa-apa
+(`lib/index.js:223`). Kedua sumber waktu tinggal di satu objek `clock` yang
+diekspor (`lib/index.js:41-48`); tes memakainya untuk memasang jam palsu, dan
+produksi tidak pernah mengubahnya.
 
 ---
 
@@ -237,8 +262,8 @@ layanan eksternal, tidak ada koneksi jaringan, tidak ada kredensial.
 
 ### 5.1 Skema tabel
 
-Tabel dibuat otomatis saat database pertama kali dibuka, dengan SQL ini persis
-seperti tertulis di `lib/index.js:68-72`:
+Tabel dibuat otomatis saat database pertama kali dibuka untuk tulis, dengan SQL ini
+persis seperti tertulis di `lib/index.js:124-128`:
 
 ```sql
 CREATE TABLE IF NOT EXISTS readcache_list_snapshot (
@@ -253,21 +278,35 @@ Penjelasan tiap kolom:
 | Kolom | Tipe | Isi |
 | --- | --- | --- |
 | `id` | INTEGER | Selalu `1`. Batasan `CHECK (id = 1)` membuat tabel ini hanya mungkin punya satu baris. |
-| `saved_at` | INTEGER | Waktu milliseconds (`Date.now()`) saat scan selesai, bukan saat baris ditulis. |
+| `saved_at` | INTEGER | Waktu milliseconds (`clock.wall()`) saat scan selesai, bukan saat baris ditulis. |
 | `headers` | TEXT | Hasil `list()` dalam bentuk JSON. |
+
+Selain kolom, skema punya **versi** di header database: `PRAGMA user_version`
+diset ke `SNAPSHOT_SCHEMA_VERSION` setiap kali plugin menulis
+(`lib/index.js:129`). Nilai `0` dianggap legal karena itu layout yang selama ini
+dipakai; nilai lain yang tidak dikenal membuat baris ditolak, bukan di-parse.
+Tidak ada migrasi: file lama dibiarkan, ditimpa oleh scan berikutnya.
+
+Isi `headers` divalidasi bentuknya sebelum dipercaya: harus array, setiap elemen
+harus objek dengan `id` string, dan tidak boleh punya key `__proto__`,
+`constructor`, atau `prototype` (penjaga prototype pollution, lihat
+`lib/index.js:150-160`). `copy()` juga membangun ulang setiap header key demi key
+sehingga key berbahaya tidak pernah ikut ke objek pemanggil (`lib/index.js:533-543`).
 
 ### 5.2 Penulisan
 
 Tidak ada perintah migrasi, seed, atau init. Baris ditulis sendiri oleh plugin,
 setelah scan `list()` selesai, di luar jalur respons pemanggil
-(`lib/index.js:379-389`). Penulisan memakai satu pernyataan
-`INSERT OR REPLACE`, jadi penulisan ulang satu baris bersifat atomik dan tidak
-membutuhkan tulis-tempel-lalu-rename seperti pada file JSON biasa.
+(`lib/index.js:559-569`). Penulisan memakai satu pernyataan berparameter
+(`?`), jadi penulisan ulang satu baris bersifat atomik dan tidak membutuhkan
+tulis-tempel-lalu-rename seperti pada file JSON biasa. Tidak ada satu pun SQL di
+repo ini yang dirakit dari string masukan: id sesi hanya pernah menjadi nilai
+(`lib/index.js:223-225`), dan `PRAGMA user_version` memakai konstanta internal.
 
 ### 5.3 Lokasi file
 
 Kalau `snapshotPath` tidak ditetapkan, plugin mencoba tiga sumber secara berurutan
-(`lib/index.js:299-320`):
+(`lib/index.js:456-477`):
 
 | Urutan | Sumber | Hasil |
 | --- | --- | --- |
@@ -282,7 +321,7 @@ memastikan `snapshot.path` bernilai `null` saat tidak ada home, dan `list()` tet
 berfungsi.
 
 Direktori induk dibuat otomatis dengan `mkdir` recursive saat database dibuka
-(`lib/index.js:66`).
+(`lib/index.js:121`).
 
 ### 5.4 Yang terjadi kalau database tidak bisa dipakai
 
@@ -291,21 +330,32 @@ Akibatnya plugin tetap berjalan. Failure mode yang tercatat di kode:
 
 | Keadaan | Yang terjadi | Di mana |
 | --- | --- | --- |
-| `better-sqlite3` gagal di-import | `openDatabase` mengembalikan `{ error }`, tidak melempar | `lib/index.js:57-63` |
-| File rusak atau bukan SQLite | Handle ditutup, error dikembalikan | `lib/index.js:76-82` |
-| Baris snapshot bukan header sesi | Ditolak, scan nyata dijalankan, dicatat di `snapshot.notes` | `lib/index.js:337-342` |
-| Snapshot terlalu tua | Ditolak, scan nyata dijalankan | `lib/index.js:344-347` |
-| Tulis snapshot gagal | Dicatat di `snapshot.notes` | `lib/index.js:386-388` |
-| Mount sudah dilepas sebelum tulis landing | Ditolak, dicatat | `lib/index.js:118-120` |
+| `better-sqlite3` gagal di-import | `openDatabase` mengembalikan `{ error }`, tidak melempar | `lib/index.js:110-117` |
+| File rusak atau bukan SQLite | Handle ditutup, error dikembalikan | `lib/index.js:130-137` |
+| Jalur baca tidak pernah menulis | Koneksi dibaca-only (`readonly`, `fileMustExist`); cache tidak butuh izin tulis hanya untuk melihat | `lib/index.js:136` |
+| Versi skema tidak dikenal | Baris ditolak, scan nyata dijalankan, dicatat di `snapshot.notes` | `lib/index.js:169-171` |
+| Baris snapshot terlalu besar | Ditolak berdasarkan `length()` sebelum di-parse, dicatat | `lib/index.js:177-185` |
+| Baris snapshot bukan header sesi | Ditolak, scan nyata dijalankan, dicatat di `snapshot.notes` | `lib/index.js:496-500` |
+| `saved_at` dari masa depan | Ditolak, scan nyata dijalankan, dicatat | `lib/index.js:507-510` |
+| Snapshot terlalu tua | Ditolak, scan nyata dijalankan, dicatat | `lib/index.js:515-518` |
+| Database terkunci (writer lain) | Tulis ditolak setelah busy timeout, dicatat; `list()` tetap dijawab | `lib/index.js:566-568` |
+| Tulis snapshot gagal (disk penuh, lokasi tak bisa ditulis) | Dicatat di `snapshot.notes`, reply pemanggil tidak terpengaruh | `lib/index.js:566-568` |
+| Mount sudah dilepas sebelum tulis landing | Ditolak, dicatat | `lib/index.js:220-222` |
 
 Alasan kegagalan selalu terlihat di endpoint metrics pada bagian 7, field
-`snapshot.notes`.
+`snapshot.notes` (5 terakhir) dan `snapshot.failures` (jumlah total). Array
+`notes` sendiri dibatasi 20 entri (`lib/index.js:98`) supaya kegagalan yang
+berulang setiap scan tidak tumbuh tanpa batas selama proses hidup.
 
 ### 5.5 Kebersihan data
 
 Indeks `id = 1` membuat tabel self-limiting: satu baris, ditimpa setiap scan.
 Tidak ada data kedaluwarsa yang menumpuk. Kalau file snapshot dihapus, plugin akan
-menjalankan scan penuh sekali lalu menulis ulang file itu.
+menjalankan scan penuh sekali lalu menulis ulang file itu. Retensi diatur oleh
+`snapshotMaxAgeMs` saat membaca, dan batas ukuran `SNAPSHOT_MAX_BYTES`
+(`lib/index.js:91`) saat membaca dan menulis: baris yang lebih besar dari itu
+ditolak, bukan dipotong. Penghapusan hanya berlaku untuk file di dalam direktori
+snapshot milik plugin sendiri.
 
 ---
 
@@ -316,7 +366,7 @@ Repo ini bukan aplikasi mandiri. Ia adalah plugin yang di-host oleh
 
 ### 6.1 Perintah boot host
 
-Bentuk perintah yang benar dapat diambil dari `tests/runtime-smoke.mjs:33-36`, yang
+Bentuk perintah yang benar dapat diambil dari `tests/runtime-smoke.mjs:60-62`, yang
 menjalankan binary CLI host dengan argumen berikut: `web`, `--profile web`,
 `--port`, `--no-open`:
 
@@ -327,10 +377,10 @@ dsh web --profile web --port 13080 --no-open
 Catatan tentang tiap bagian perintah ini:
 
 - `--profile web` dipakai oleh test smoke, jadi nama profilnya memang `web`
-  (`tests/runtime-smoke.mjs:35`).
+  (`tests/runtime-smoke.mjs:61`).
 - `--port 13080` adalah port yang dipakai script pengukuran di repo ini
   (`smoke-test.mjs:18` dan `measure-e2e.mjs:4` menuliskan
-  `http://127.0.0.1:13080`). `tests/runtime-smoke.mjs:36` memakai `--port 0`,
+  `http://127.0.0.1:13080`). `tests/runtime-smoke.mjs:62` memakai `--port 0`,
   yang berarti OS memilih port sendiri. Kedua bentuk itu valid; angka 13080 bukan
   default yang dipatok plugin.
 - `--no-open` mencegah host membuka browser sendiri.
@@ -344,22 +394,27 @@ pengukuran. Jangan menganggap `13080` sebagai default.
 Plugin memberi dua tanda bahwa ia benar-benar terpasang:
 
 1. Di stderr atau log host, ada baris mount dengan ringkasan konfigurasi
-   (`lib/index.js:545`):
+   (`lib/index.js:804`):
 
    ```text
    [session-readcache] mounted (maxEntries=24, maxTotalEvents=250000, listTtlMs=750, listMaxStaleMs=30000, snapshotMaxAgeMs=600000)
    ```
 
    Baris ini ditulis dua kali, sekali ke `process.stderr` dan sekali ke
-   `ctx.logger`. String persis yang dicari ada di `tests/runtime-smoke.mjs:51`:
+   `ctx.logger`. String persis yang dicari ada di `tests/runtime-smoke.mjs:82`:
    `out.includes('[session-readcache] mounted')`.
 
 2. Endpoint metrics menjawab dengan JSON. Perintah dan bentuk responsnya ada di
    bagian 7.
 
-Kalau `ctx.webServer` tidak ada, plugin tetap berjalan tanpa endpoint dan mencatat
-`[session-readcache] webServer unavailable; metrics/purge endpoints not exposed`
-(`lib/index.js:542`). Boot tidak pernah diblokir oleh ketiadaan endpoint.
+Kalau `ctx.webServer` belum tersedia saat mount, plugin tetap berjalan, mencatat
+`[session-readcache] webServer unavailable at mount; metrics/purge endpoints will
+register when it appears` (`lib/index.js:798`), dan endpoint didaftarkan kemudian
+lewat `ctx.inject(['webServer'], ...)` saat service itu muncul
+(`lib/index.js:774-794`). Bila service itu tidak pernah ada, plugin tetap cache
+tanpa endpoint. Boot tidak pernah diblokir oleh ketiadaan endpoint, dan
+ketiadaan web surface tidak lagi membuat plugin tidak aktif sama sekali: itu
+perilaku lama yang sudah diperbaiki (lihat `lib/index.js:10-19`).
 
 ### 6.3 Build, lint, service lain
 
@@ -380,20 +435,20 @@ Contoh lengkap dari start sampai melihat bukti plugin bekerja.
 curl http://127.0.0.1:13080/plugin/session-readcache/metrics
 ```
 
-Bentuk responsnya diambil dari handler di `lib/index.js:481-498`:
+Bentuk responsnya diambil dari handler di `lib/index.js:693-710`:
 
 ```json
 {
   "inspect": { "hits": 0, "misses": 0, "stale": 0, "liveSkips": 0 },
   "list": { "hits": 0, "misses": 0, "staleServed": 0 },
-  "cache": { "entries": 0, "totalCost": 0, "inflight": 0 },
-  "snapshot": { "path": null, "seedResolved": false, "seeded": false, "notes": [] }
+  "cache": { "entries": 0, "totalCost": 0, "inflight": 0, "coalesceLimit": 24 },
+  "snapshot": { "path": null, "seedResolved": false, "seeded": false, "saves": 0, "failures": 0, "notes": [] }
 }
 ```
 
 Angka nol di atas adalah keadaan awal yang sebenarnya. Semua penghitung
-diinisialisasi ke `0` di `lib/index.js:142` dan `listSeed` mulai sebagai
-`undefined` (`lib/index.js:298`), yang diterjemahkan ke `seedResolved: false`.
+diinisialisasi ke `0` di `lib/index.js:267` dan `listSeed` mulai sebagai
+`undefined` (`lib/index.js:455`), yang diterjemahkan ke `seedResolved: false`.
 
 Arti setiap field:
 
@@ -401,21 +456,24 @@ Arti setiap field:
 | --- | --- | --- |
 | `inspect.hits` | `inspect(id)` dilayani dari cache | Stat file tidak berubah dan sesi tidak sedang aktif |
 | `inspect.misses` | `inspect(id)` membaca ulang dari disk | Entri tidak ada, atau stat tidak cocok |
-| `inspect.stale` | Entri dibuang karena file benar-benar berubah | Revisi file beda. **Tidak** naik hanya karena sesi jadi aktif, itu dihitung di `liveSkips` (`lib/index.js:230`) |
-| `inspect.liveSkips` | Sesi aktif ditolak untuk disimpan | Sesi sedang aktif, jadi event-nya berubah terus (`lib/index.js:258`) |
+| `inspect.stale` | Entri dibuang karena file benar-benar berubah | Revisi file beda. **Tidak** naik hanya karena sesi jadi aktif atau karena sesi dibuang, itu dihitung di `liveSkips` (`lib/index.js:387`) |
+| `inspect.liveSkips` | Sesi aktif ditolak untuk disimpan | Sesi sedang aktif, jadi event-nya berubah terus (`lib/index.js:415`) |
 | `list.hits` | `list()` dilayani dalam TTL | Umur memo kurang dari `listTtlMs` |
-| `list.misses` | Scan direktori nyata dijalankan | Dihitung di dalam memo (`lib/index.js:376`), jadi termasuk scan yang dijalankan untuk mencari path log, bukan cuma pemanggil `list()` |
-| `list.staleServed` | Dilayani dari jendela stale | Umur memo antara `listTtlMs` dan `listTtlMs + listMaxStaleMs` (`lib/index.js:432-436`) |
+| `list.misses` | Scan direktori nyata dijalankan | Dihitung di dalam memo (`lib/index.js:556`), jadi termasuk scan yang dijalankan untuk mencari path log, bukan cuma pemanggil `list()` |
+| `list.staleServed` | Dilayani dari jendela stale | Umur memo antara `listTtlMs` dan `listTtlMs + listMaxStaleMs` (`lib/index.js:617-621`) |
 | `cache.entries` | Jumlah entri yang tersimpan | Setelah `inspect` miss yang berhasil di-cache |
 | `cache.totalCost` | Total event terparse yang dibebankan | Jumlah `events.length` dari seluruh entri |
 | `cache.inflight` | Baca yang sedang digabung | Saat beberapa `inspect(id)` tanpa signal berjalan bersamaan |
+| `cache.coalesceLimit` | Batas ukuran map in-flight | Setelah batas ini baca baru tidak digabung lagi: tidak diantre, tidak dibuang, hanya dijalankan terpisah (`lib/index.js:312`) |
 | `snapshot.path` | Lokasi file snapshot, `null` bila dimatikan | Dihitung sekali saat mount |
 | `snapshot.seedResolved` | Seed boot sudah dicoba | Setelah satu pemanggilan `list()`, apa pun hasilnya |
-| `snapshot.seeded` | Memo sedang holds data dari snapshot | True sampai scan nyata berikutnya menggantikannya (`lib/index.js:355`, `493`) |
-| `snapshot.notes` | Alasan persistensi snapshot tidak bekerja | Maksimal 5 catatan terakhir (`lib/index.js:494`) |
+| `snapshot.seeded` | Memo sedang holds data dari snapshot | True sampai scan nyata berikutnya menggantikannya (`lib/index.js:523`, `715`) |
+| `snapshot.saves` | Snapshot yang berhasil ditulis | Setiap penulisan row yang sukses |
+| `snapshot.failures` | Snapshot yang gagal dibaca atau ditulis | Setiap penolakan: rusak, versi skema asing, terlalu besar, terlalu tua, `saved_at` di masa depan, gagal tulis |
+| `snapshot.notes` | Alasan persistensi snapshot tidak bekerja | Maksimal 5 catatan terakhir (`lib/index.js:708`) |
 
 Penghitung direset setiap restart, karena mereka hidup di dalam closure `apply()`
-(`lib/index.js:142`) dan bukan di penyimpanan.
+(`lib/index.js:267`) dan bukan di penyimpanan.
 
 ### 7.2 Bersihkan cache satu sesi atau semuanya
 
@@ -427,7 +485,7 @@ curl -X POST 'http://127.0.0.1:13080/plugin/session-readcache/purge?id=s1'
 curl -X POST 'http://127.0.0.1:13080/plugin/session-readcache/purge'
 ```
 
-Bentuk responsnya dari `lib/index.js:535`:
+Bentuk responsnya dari `lib/index.js:752`:
 
 ```json
 { "purged": 1 }
@@ -436,7 +494,7 @@ Bentuk responsnya dari `lib/index.js:535`:
 Perilaku yang perlu diketahui:
 
 - Metode selain `POST` ditolak dengan status 405 dan badan
-  `{ "error": "method not allowed; use POST" }` (`lib/index.js:503-508`).
+  `{ "error": "method not allowed; use POST" }` (`lib/index.js:717-722`).
 - Dengan `?id=`, entri itu dihapus dari cache dan dari daftar in-flight.
   `purged: 1` kalau ditemukan, `0` kalau tidak.
 - Tanpa `id`, semua entri dan semua in-flight dikosongkan, dan `purged` berisi
@@ -445,7 +503,7 @@ Perilaku yang perlu diketahui:
   path log yang sudah ketemu, sehingga baca berikutnya tetap melewati scan
   direktori walau view-nya dibaca ulang.
 - Pembersihan menaikkan epoch invalidasi. Baca yang sedang berjalan saat itu tidak
-  akan memasang view-nya setelah selesai (`lib/index.js:512`, `268`). Menghapus
+  akan memasang view-nya setelah selesai (`lib/index.js:726`, `268`). Menghapus
   `id` yang tidak ada hanya melaporkan `purged: 0` tetapi tetap menaikkan epoch.
 
 ### 7.3 Bentuk normal setelah dipakai
@@ -455,7 +513,7 @@ Setelah beberapa sesi dibuka dan ditutup ulang di GUI, bentuk yang wajar adalah
 sementara `list.hits` tetap dekat nol. Itu bukan tanda kegagalan: kalau satu scan
 `list()` memakan detik, memo dengan TTL 750 ms sudah basi sebelum pemanggil yang
 memicunya selesai. Bentuk itu justru yang sehat pada host seperti ini, dan
-dijelaskan di `lib/index.js:16-22`.
+dijelaskan di `lib/index.js:24-30`.
 
 ### 7.4 Angka yang tercatat di repo
 
@@ -465,7 +523,7 @@ direkam di dalam repo, di `README.md` lama dan di
 
 | Pengukuran | Angka yang tercatat | Sumber |
 | --- | --- | --- |
-| Scan `list()` langsung pada korpus 3.847 log | 9.761 ms saat cold | `lib/index.js:47` |
+| Scan `list()` langsung pada korpus 3.847 log | 9.761 ms saat cold | `lib/index.js:79` |
 | Scan header serial saat warm | 2.703 - 3.007 ms | `docs/HOST-TICKET-sessionListMetadata.md` bagian 2.1 E2 |
 | Scan header 32-way paralel | 1.429 ms | idem, E3 |
 | RPC `session.list` yang ditunggu pengguna | 9,0 - 10,2 detik | idem, E4 |
@@ -613,14 +671,17 @@ adalah tiga file yang dieksekusi langsung oleh `node` atau `tsx`. Masing-masing
 mempunyai loop sendiri di baris terakhir yang mencetak hasil per test lalu keluar
 dengan kode tertentu.
 
-Perhatikan bahwa `SECURITY-AUDIT.md` bagian 7 mencatat bahwa
-`node --test tests/` keluar dengan kode 1 pada kedua commit karena berkas-berkas
-di `tests/` bukan suite `node:test`. Itu perilaku yang sudah diketahui, bukan
-regresi.
+Perhatikan bahwa `node --test tests/` (dengan garis miring, tanpa glob) **gagal
+resolve** di Node 24: `Cannot find module .../tests`, exit 1. Bentuk yang bekerja
+adalah glob: `node --test "tests/*.mjs"`. Terukur pada perubahan hardening
+2026-10-09: `tests 3, pass 2, fail 1` — yang gagal `tests/runtime-smoke.mjs`,
+karena berkas itu sekarang fail-closed dan di lingkungan ini host child mati lebih
+dulu (alasannya ada di bagian 10.6). `tests/logic.mjs` dan
+`tests/subagent-signal.mjs` lulus juga di bawah `node --test`.
 
 ### 10.2 Cara keberhasilan dilaporkan
 
-Loop di `tests/logic.mjs:778-784` dan `tests/subagent-signal.mjs:139-145` memakai
+Loop di baris terakhir `tests/logic.mjs` dan `tests/subagent-signal.mjs` memakai
 pola yang sama:
 
 ```javascript
@@ -653,17 +714,23 @@ eksplisit, jadi kegagalan berupa exception yang tidak tertangani.
 
 | File | Jumlah test | Cara tahu |
 | --- | --- | --- |
-| `tests/logic.mjs` | 41 | Dihitung dari 41 pemanggilan `test(...)` di file |
+| `tests/logic.mjs` | 70 | Dihitung dari 70 pemanggilan `test(...)` di file |
 | `tests/subagent-signal.mjs` | 8 | Dihitung dari 8 pemanggilan `test(...)` di file |
 | `tests/realfile.mts` | Bukan suite | 5 assertion, tidak punya label test |
 
 Jumlah dihitung dari isi file, bukan dari hasil eksekusi pada sesi penulisan
-dokumen ini. Inventaris sesi mencatat hasil eksekusi `ALL 41 PASS`,
-`ALL 8 PASS`, dan `ALL PASS` untuk ketiga file itu.
+dokumen ini. Eksekusi terakhir yang tercatat: `ALL 70 PASS`, `ALL 8 PASS`, dan
+`ALL PASS` untuk ketiga file itu (lihat bagian 10.6 untuk apa yang belum
+terverifikasi).
+
+Suite ini **tidak** membaca atau menulis snapshot hidup. `DSH_HOME` dihapus di
+awal berkas (`tests/logic.mjs:84-87`), karena di lingkungan dev variabel itu
+mengarah ke snapshot host yang berisi ribuan header nyata; tes yang menguji
+persistensi selalu memakai `snapshotPath` eksplisit di bawah `tmpdir()`.
 
 ### 10.4 Jenis test yang ada
 
-**`tests/logic.mjs`, 41 test.** Semua berjalan terhadap service palsu
+**`tests/logic.mjs`, 70 test.** Semua berjalan terhadap service palsu
 (`makeFake()` di baris 27) dengan file sementara di `tmpdir()` sungguhan, supaya
 validasi `stat` benar-benar jalan dan bukan mock. Kelompoknya:
 
@@ -685,6 +752,34 @@ validasi `stat` benar-benar jalan dan bukan mock. Kelompoknya:
 | Purge | `purge: a read parked on the cache-hit path cannot restore the purged entry` | Interaksi purge dan baca yang sedang menunggu stat |
 | Metrics | `metrics: counts inspect hits/misses and list hits/misses` | Bentuk JSON metrics |
 | Dispose | `dispose restores original methods` | Unmount mengembalikan method asli |
+| LRU | `inspect: a hit refreshes recency, so the oldest entry is the one evicted` | Hit memperbarui recency, eviction benar-benar LRU |
+| LRU | `inspect: resident events never exceed maxTotalEvents` | Anggaran event adalah batas keras |
+| LRU | `inspect: an attach race with signalled readers does not corrupt the cost accounting` | Satu biaya dikurangi tepat sekali (regresi buku biaya) |
+| Paralel | `inspect: concurrent reads of one id fold into one host read, distinct ids do not` | Hanya permintaan ekuivalen yang digabung |
+| Paralel | `inspect: the in-flight slot is released after success and after failure` | Slot in-flight bersih setelah resolve dan reject |
+| Parsial | `inspect: an empty view is not cached (a partial result is not a result)` | Hasil parsial tidak masuk cache |
+| Ekivalensi | `inspect: cache on and cache off return the same data` | Cache aktif identik secara fungsional dengan cache mati |
+| Lifecycle | `inspect: a session that was disposed is re-read from the host` | Sesi dibuang tidak dilayani dari cache |
+| Lifecycle | `inspect: a read parked on the stat when the dispose lands delegates to the host` | Baca yang tertahan di stat jatuh ke host |
+| Lifecycle | `inspect: a deleted log re-reads and the host error still surfaces` | File hilang: error host tetap muncul |
+| Lifecycle | `inspect: a recreated log (new inode, same size) invalidates the entry` | Identitas file bagian dari cache key |
+| TTL | `list: TTL boundary — just before expiry is a hit, at expiry is a scan` | Batas tepat TTL, jam palsu, tanpa sleep panjang |
+| TTL | `list: stale window boundary — inside it the last scan is served, past it the caller waits` | Batas tepat jendela stale |
+| TTL | `list: a backwards wall-clock step cannot extend the memo` | Langkah jam dinding tak memperpanjang memo |
+| Snapshot | `snapshot: a row written by an unknown schema version is refused` | Versi skema divalidasi |
+| Snapshot | `snapshot: a saved_at from the future is refused` | Cap masa depan korup ditolak |
+| Snapshot | `snapshot: an oversized row is refused without being materialised` | Batas ukuran baris |
+| Snapshot | `snapshot: a row holding a prototype-reaching key is refused` | Prototype pollution lewat snapshot ditolak |
+| Snapshot | `list: a served header copy cannot carry a prototype-reaching key` | Salinan header membuang key berbahaya |
+| Snapshot | `snapshot: a locked database is recorded and list() still answers` | DB terkunci: fallback + terobservasi |
+| Snapshot | `snapshot: an unwritable snapshot location is recorded and list() still answers` | Lokasi tak bisa ditulis: fallback + terobservasi |
+| Snapshot | `snapshot: repeated failed writes cannot grow the notes array without bound` | Array notes dibatasi |
+| Injeksi | `inspect: a session id carrying SQL metacharacters is only ever a value` | Id SQL-ish hanya pernah jadi nilai |
+| Konfig | `config: invalid values fall back to the documented defaults and say so` | Nilai tidak valid dilaporkan, bukan didiamkan |
+| Konfig | `config: boundary values are accepted and keep their meaning` | Nilai batas diterima |
+| Konfig | `config: enabled false disables the plugin; a non-boolean enabled does not` | Hanya `false` persis mematikan plugin |
+| Fallback | `cache: a bookkeeping failure never breaks the read` | Kegagalan cache tidak merusak baca |
+| Mount | `inspect: the plugin still wraps the service when no webServer exists` | Tanpa web surface plugin tetap aktif |
 
 **`tests/subagent-signal.mjs`, 8 test.** Semua tentang `AbortSignal`, yaitu objek
 yang dipakai host untuk meminta pembacaan dihentikan. Berkas ini adalah bukti
@@ -713,12 +808,12 @@ nyata. Yang ia lakukan, semua terlihat di berkasnya sendiri:
 
 | Test | Prasyarat | Sumber |
 | --- | --- | --- |
-| `tests/logic.mjs` | `better-sqlite3` bisa di-import. Test snapshot memakainya langsung lewat `createRequire` (`tests/logic.mjs:16`, `78`) | Berkas test |
+| `tests/logic.mjs` | `better-sqlite3` bisa di-import. Test snapshot memakainya langsung lewat `createRequire` (`tests/logic.mjs:5`, `91`, `105`) | Berkas test |
 | `tests/subagent-signal.mjs` | Hanya `node` | Berkas test |
 | `tests/realfile.mts` | `tsx`; checkout host di `/home/administrator/deepseek-harness`; direktori sesi di `/home/administrator/agent-workspace/.dsh/sessions` | `tests/realfile.mts:7` dan `12` |
 | `smoke-test.mjs` | Host hidup di `127.0.0.1:13080`. Komentar di `smoke-test.mjs:9` menyatakan asumsi itu eksplisit | Berkas test |
 | `measure-e2e.mjs` | Host hidup di `127.0.0.1:13080` | `measure-e2e.mjs:4` |
-| `tests/runtime-smoke.mjs` | Checkout host di `/home/administrator/deepseek-harness` | `tests/runtime-smoke.mjs:10` |
+| `tests/runtime-smoke.mjs` | Checkout host di `/home/administrator/deepseek-harness`; `tsx` resolvable dari sana | `tests/runtime-smoke.mjs:11-15` |
 
 `tsx` **bukan** dependensi repo ini. Inventaris sesi mencatat binarynya tersedia di
 `/home/administrator/deepseek-harness/node_modules/.bin/tsx`, dari checkout host.
@@ -737,11 +832,28 @@ lewati bagian ini:
   `packages/subagent/subagent/src/list-children.ts:382` dan `continuation.ts:954`
   baru diuji lewat `tests/logic.mjs` dan `tests/subagent-signal.mjs`. Belum ada
   bukti eksekusi end-to-end di jalur subagent (`SECURITY-AUDIT.md` bagian 4).
-- Barrier `waitForRetirement` tidak bisa diamati dari posisi plugin
-  (`SECURITY-AUDIT.md` bagian 9).
-- `tests/runtime-smoke.mjs` tercatat keluar dengan kode 0 tanpa pernah menjalankan
-  subjeknya (`SECURITY-AUDIT.md` bagian 9, butir BUG-6). Perlakukan berkasnya
-  sebagai alat investigasi, bukan bukti.
+- **Validasi store-level yang hanya bisa dilihat dengan scan direktori tetap tidak
+  ditiru.** Cache hit memvalidasi berkas artifact-nya, bukan seluruh pojok store.
+  Kalau store rusak dengan cara yang hanya terlihat lewat scan (id kembar di dua
+  direktori proyek, artifact dengan encoding berlawanan), plugin tetap
+  mengembalikan view yang sudah di-cache selama host yang belum ter-cache akan
+  menolak. Ini batas desain, bukan cacat baru: menghilangkannya butuh scan penuh,
+  yaitu tepat biaya yang cache ini ada untuk menghindari. Batas ini tetap tercatat
+  di `SECURITY-AUDIT.md`.
+- Invalidasi sesi dibuang bergantung pada event host `session/disposed`. Bila host
+  tidak mengirim event itu untuk lifecycle tertentu, invalidasi untuk kasus itu
+  tidak terjadi dan view lama bisa dilayani sampai TTL, eviction, atau stat
+  berikutnya. Yang menggerakkan event itu sudah diuji terhadap stack host nyata
+  (bukti di `artifacts/verify-h03-race.mjs`), tapi belum terhadap GUI hidup.
+- `tests/runtime-smoke.mjs` sekarang **fail-closed**: ia keluar 1 dengan alasan
+  yang jelas kalau banner mount tidak teramati, child mati lebih dulu, atau probe
+  RPC gagal (`tests/runtime-smoke.mjs:24-27`). Versi lama keluar 0 tanpa pernah
+  mengamati apa pun; itu sudah diperbaiki. Di lingkungan dev repo ini berkas itu
+  keluar 1 karena checkout host yang memuat CLI dari source tidak sinkron dengan
+  `lib/` build-nya (`@deepseek-ai/cordis` tidak mengekspor `FiberState`), jadi
+  jangan dijadikan bukti perilaku plugin; bukti mount ada di
+  `artifacts/probe-mount.mjs` dan `artifacts/verify-h03-race.mjs` yang memasang
+  plugin di atas service host nyata.
 
 ---
 
@@ -761,17 +873,17 @@ Penyebab yang mungkin, urut dari yang paling mungkin:
 | --- | --- | --- |
 | Plugin belum terdaftar di profil web | Cek daftar bundle di `~/.dsh/profiles/web/package.json` | Jalankan perintah add di bagian 3.2 |
 | Server berjalan sejak sebelum plugin dipasang | Proses host memuat ESM sekali saja saat boot (`README.md` lama, bagian rebuild) | Restart web server |
-| `enabled: false` | Cari di log: `[session-readcache] disabled by config` (`lib/index.js:134`) | Ubah `enabled` di `cordis.patch.yml` |
+| `enabled: false` | Cari di log: `[session-readcache] disabled by config` (`lib/index.js:235`) | Ubah `enabled` di `cordis.patch.yml` |
 | Baris plugin tidak masuk patch | Bandingkan `package.json` baris dsh.bundle.patch dengan file `cordis.patch.yml` yang aktif di host | Pastikan blok `dsh.bundle.patch` masih menunjuk ke `cordis.patch.yml` |
 
 ### 11.2 Endpoint metrics tidak ada padahal plugin mounted
 
 Gejala: baris mount ada, tapi `curl .../metrics` tidak menjawab.
 
-Kode menebak-nebak apa yang terjadi: `lib/index.js:541-543` hanya menulis
+Kode menebak-nebak apa yang terjadi: `lib/index.js:768-801` hanya menulis
 peringatan ketika `ctx.webServer === undefined`. Kalau `ctx.webServer` ada tapi
 `register` gagal, pesannya berbeda: `[session-readcache] route registration failed:
-<pesan>` (`lib/index.js:539`).
+<pesan>` (`lib/index.js:777`, `790`).
 
 Periksa:
 
@@ -792,7 +904,7 @@ Gejala:
 ```
 
 Penyebab: purge mengubah state, jadi `GET` sengaja ditolak untuk mencegah
-penghapusan cache yang tidak disengaja (`lib/index.js:503-508`).
+penghapusan cache yang tidak disengaja (`lib/index.js:717-722`).
 
 Perbaikan: pakai `POST`.
 
@@ -808,11 +920,11 @@ Baca `snapshot.notes` lebih dulu, karena alasannya selalu ditulis di sana:
 
 | Isi `snapshot.notes` | Penyebab | Perbaikan |
 | --- | --- | --- |
-| `snapshot headers are not session headers; rescanning` | Baris snapshot berisi yang bukan objek header sesi (`lib/index.js:340`) | Hapus file snapshot, lalu biarkan scan nyata menulis ulang |
-| `snapshot too old (Xs); rescanning` | `saved_at` lebih tua dari `snapshotMaxAgeMs` (`lib/index.js:345`) | Normal. Turunkan `snapshotMaxAgeMs` hanya bila memang ingin menerima data lebih tua |
-| `snapshot load failed: <pesan>` | Database gagal dibuka atau dibaca (`lib/index.js:327`) | Periksa hak tulis direktori dan keutuhan file |
-| `snapshot save failed: unmounted before the snapshot write landed` | Mount sudah dilepas sebelum tulis landing (`lib/index.js:119`) | Normal pada reload. Bukan kegagalan |
-| `snapshot save failed: <pesan lain>` | Tulis gagal setelah database terbuka (`lib/index.js:387`) | Periksa ruang disk dan izin direktori |
+| `snapshot headers are not session headers; rescanning` | Baris snapshot berisi yang bukan objek header sesi (`lib/index.js:497`) | Hapus file snapshot, lalu biarkan scan nyata menulis ulang |
+| `snapshot too old (Xs); rescanning` | `saved_at` lebih tua dari `snapshotMaxAgeMs` (`lib/index.js:512`) | Normal. Turunkan `snapshotMaxAgeMs` hanya bila memang ingin menerima data lebih tua |
+| `snapshot load failed: <pesan>` | Database gagal dibuka atau dibaca (`lib/index.js:484`) | Periksa hak tulis direktori dan keutuhan file |
+| `snapshot save failed: unmounted before the snapshot write landed` | Mount sudah dilepas sebelum tulis landing (`lib/index.js:220`) | Normal pada reload. Bukan kegagalan |
+| `snapshot save failed: <pesan lain>` | Tulis gagal setelah database terbuka (`lib/index.js:568`) | Periksa ruang disk dan izin direktori |
 
 Kalau `snapshot.path` bernilai `null`, persistentinya memang tidak diaktifkan.
 Baca bagian 5.3: plugin tidak menebak lokasi, jadi tanpa `snapshotPath`, tanpa
@@ -826,10 +938,10 @@ Empat penyebab yang bisa dijelaskan oleh kode:
 
 | Penyebab | Kenapa | Cara memastikan |
 | --- | --- | --- |
-| Sesi sedang aktif | Sesi aktif ditolak untuk di-cache demi kebenaran (`lib/index.js:257-260`) | `inspect.liveSkips` naik |
-| Tidak ada path log yang bisa ditentukan | Cache butuh path file untuk melakukan stat sebelum baca (`lib/index.js:253`) | `target.locate()` tidak mengembalikan `path` untuk header itu |
-| View-nya tidak berasal dari file yang di-stats | Kalau header yang terdaftar dan `meta` yang kembali menunjuk artefak berbeda, tidak ada yang di-cache (`lib/index.js:265-266`) | Bandingkan keduanya |
-| Tolak ukuran | Kalau `events.length` melebihi `maxTotalEvents`, tidak ada yang di-cache (`lib/index.js:268`) | Naikkan `maxTotalEvents` |
+| Sesi sedang aktif | Sesi aktif ditolak untuk di-cache demi kebenaran (`lib/index.js:414-417`) | `inspect.liveSkips` naik |
+| Tidak ada path log yang bisa ditentukan | Cache butuh path file untuk melakukan stat sebelum baca (`lib/index.js:628-657`) | `target.locate()` tidak mengembalikan `path` untuk header itu |
+| View-nya tidak berasal dari file yang di-stats | Kalau header yang terdaftar dan `meta` yang kembali menunjuk artefak berbeda, tidak ada yang di-cache (`lib/index.js:422-423`) | Bandingkan keduanya |
+| Tolak ukuran | Kalau `events.length` melebihi `maxTotalEvents`, tidak ada yang di-cache (`lib/index.js:424`) | Naikkan `maxTotalEvents` |
 
 Perhatikan bahwa `inspect.stale` **tidak** naik karena sesi jadi aktif, itu dihitung
 di `liveSkips`.
@@ -839,7 +951,7 @@ di `liveSkips`.
 Ini bukan kegagalan. Kalau satu scan `list()` memakan waktu berdetik-detik, memo
 750 ms sudah basi sebelum pemanggil yang memicunya selesai. Gejala yang benar
 adalah `list.staleServed` yang naik. Penjelasan yang sama tertulis di komentar
-`lib/index.js:16-22`, dan alasannya diukur di
+`lib/index.js:24-30`, dan alasannya diukur di
 `docs/HOST-TICKET-sessionListMetadata.md`.
 
 Kalau memang butuh hit, naikkan `listTtlMs` lewat konfigurasi. Konsekuensinya,
@@ -916,10 +1028,19 @@ Ada empat kontrak yang disebut berulang kali di `lib/index.js` dan di
 
 | Kontrak | Aturannya | Di mana dijaga |
 | --- | --- | --- |
-| Cache bersifat advisory | Setiap kegagalan di lapisan cache harus jatuh ke method asli | `lib/index.js:280-282`, `463-465` |
-| Hanya cold-only | Sesi yang sedang aktif tidak pernah di-cache, dan setiap jalur cache mengecek ulang sebelum mengembalikan | `lib/index.js:211`, `257-260` |
-| Set faithfully pada pembatalan | Pemanggil yang membawa signal tidak pernah digabung, dan signal diperiksa ulang setiap `await` | `lib/index.js:178-181`, `199`, `210` |
-| Bungkus hanya cold | Method tulis, `load`, `prepare`, dan perbaikan tidak dibungkus | Hanya `inspect` dan `list` yang di-`defineProperty` (`lib/index.js:468-469`) |
+| Cache bersifat advisory | Setiap kegagalan di lapisan cache harus jatuh ke method asli | `lib/index.js:436-439`, `636-657` |
+| Hanya cold-only | Sesi yang sedang aktif tidak pernah di-cache, dan setiap jalur cache mengecek ulang sebelum mengembalikan | `lib/index.js:360-369`, `421-424` |
+| Set faithfully pada pembatalan | Pemanggil yang membawa signal tidak pernah digabung, dan signal diperiksa ulang setiap `await` | `lib/index.js:328-331`, `357`, `369` |
+| Bungkus hanya cold | Method tulis, `load`, `prepare`, dan perbaikan tidak dibungkus | Hanya `inspect` dan `list` yang di-`defineProperty` (`lib/index.js:652-654`) |
+| Invalidasi lifecycle | Sesi yang dibuang berhenti dilayani dari cache sebelum host selesai menulis event terakhirnya | `lib/index.js:661-675`, `367-376` |
+
+Kontrak kelima adalah tambahan dari hardening 2026-10-09. Sebelumnya entri cache
+satu sesi bisa bertahan melewati pembuangan sesi itu, dan karena pemanggil yang
+datang tepat setelah `session/disposed` melihat sesi sebagai cold (sudah keluar
+dari store) sementara flush terakhir belum mendarat, jalur hit pernah
+mengembalikan view yang host sendiri tolak. Bukti sebelum/sesudah terhadap stack
+host nyata: `artifacts/h03-before-dispose-fix.out` (11/12 stale) dan
+`artifacts/h03-after-dispose-fix.out` (0/12).
 
 ### 12.3 Alur kerja yang sesuai dengan repo
 
@@ -962,14 +1083,18 @@ dari struktur file dan catatan di dalam kode:
 
 LANGKAH-langkahnya mengikuti pola yang sudah ada:
 
-1. Tambah kunci ke `DEFAULTS` di `lib/index.js:12-26`, dengan komentar yang
+1. Tambah kunci ke `DEFAULTS` di `lib/index.js:20-34`, dengan komentar yang
    menjelaskan alasan nilai itu.
-2. Baca dengan validator yang sudah ada: `positiveInt` untuk nilai yang harus
-   positif, `nonNegativeInt` untuk nilai yang boleh nol (`lib/index.js:28-34`).
-3. Tulis ke ringkasan mount di `lib/index.js:544` supaya nilai efektif terlihat
-   di log saat boot.
+2. Baca lewat `readCount` di `lib/index.js:53-60` (menggantikan pakaian
+   `positiveInt`/`nonNegativeInt` yang hanya diam-diam jatuh ke default). Daftar
+   kunci beserta aturan boleh-nol-nya ada di `countSpecs`, `lib/index.js:245-252`.
+3. Tulis ke ringkasan mount di `lib/index.js:803` supaya nilai efektif terlihat
+   di log saat boot, dan pastikan nilai tidak valid memicu peringatan
+   (`lib/index.js:258-261`) bukan diam-diam diganti.
 4. Tulis ulang nilai yang sama di `cordis.patch.yml` supaya terlihat di konfigurasi.
-5. Tambah test di `tests/logic.mjs` yang mengunci perilakunya.
+5. Tambah test di `tests/logic.mjs` yang mengunci perilakunya, termasuk test
+   nilai tidak valid (lihat `config: invalid values fall back to the documented
+   defaults and say so`).
 
 ### 12.5 Peringatan khusus
 
@@ -1010,7 +1135,7 @@ Jika `dsh` tidak menambahkan bundle secara otomatis, tambahkan
 ### 13.3 Environment variable produksi
 
 Tidak ada environment variable yang wajib diisi untuk produksi. `DSH_HOME` dibaca
-sebagai fallback lokasi snapshot saja (`lib/index.js:313-316`), dan host biasanya
+sebagai fallback lokasi snapshot saja (`lib/index.js:860-473`), dan host biasanya
 sudah menyediakan service `dshHomePath` yang lebih diprioritaskan.
 
 Nilai konfigurasi produksi lengkap disetel di `cordis.patch.yml`, bukan lewat
@@ -1096,8 +1221,8 @@ penting untuk diketahui:
   mengizinkan.
 - Purge menolak semua metode selain POST dengan 405.
 - Kedua route didaftarkan di dalam guard `ctx.inject`, supaya pemasangan ganda
-  tidak menabrak error path ganda dari web server (`lib/index.js:476-477`).
-- Kedua route dilepas saat plugin dilepas (`lib/index.js:552-553`).
+  tidak menabrak error path ganda dari web server (`lib/index.js:768-801`).
+- Kedua route dilepas saat plugin dilepas (`lib/index.js:810-811`).
 
 Perhatikan konsekuensinya: kalau web server host Anda terbuka ke jaringan tanpa
 autentikasi, endpoint purge bisa dihapus dari cache oleh siapa pun yang bisa
@@ -1259,13 +1384,13 @@ Bukan bagian untuk pembaca umum.
 - Semua path yang disebut: `lib/index.js`, `cordis.patch.yml`, `tests/*.mjs`,
   `tests/realfile.mts`, `docs/...`, `SECURITY-AUDIT.md`, `pnpm-lock.yaml`,
   `.gitignore`, `smoke-test.mjs`, `measure-e2e.mjs`, `tests/runtime-smoke.mjs`.
-- Semua nama environment variable: hanya `DSH_HOME`, dari `lib/index.js:313` dan
-  `tests/runtime-smoke.mjs:39`.
+- Semua nama environment variable: hanya `DSH_HOME`, dari `lib/index.js:860` dan
+  `tests/runtime-smoke.mjs:66`.
 - Semua angka versi: `0.1.0`, `>=20`, `>=0.1.1-rc.1`, `13.0.3`, `8.9.2`, `>=22`.
 - Semua string error dan kondisi gagal yang dipakai di bagian 11, semuanya
   ditelusuri ke baris yang disebut.
 - Port `13080`, dari `smoke-test.mjs:18` dan `measure-e2e.mjs:4`.
-- Path endpoint metrics dan purge, dari `lib/index.js:480` dan `501`.
+- Path endpoint metrics dan purge, dari `lib/index.js:692` dan `501`.
 - Jumlah test 41 dan 8, dengan cara hit yang dinyatakan di bagian 10.3.
 
 **Inferred**, ditulis dengan label eksplisit:
@@ -1273,7 +1398,7 @@ Bukan bagian untuk pembaca umum.
 - `pnpm install` sebagai perintah install, diturunkan dari keberadaan
   `pnpm-lock.yaml`. Dinyatakan di bagian 3.1 dan 9.1.
 - Gabungannya `dsh web --profile web --port 13080 --no-open` di bagian 6.1.
-  Flag-flagnya observed dari `tests/runtime-smoke.mjs:33-36`; angka `13080` berasal
+  Flag-flagnya observed dari `tests/runtime-smoke.mjs:60-62`; angka `13080` berasal
   dari konvensi pengukuran, bukan default host.
 - Blok YAML di bagian 4, disusun ulang dari baris `insert` yang ada di
   `cordis.patch.yml` tanpa mengubah nilai.
@@ -1318,7 +1443,7 @@ Bukan bagian untuk pembaca umum.
    dipakai runtime adalah `prebuilds/`, karena `better-sqlite3` 13.x memakai
    prebuild, bukan hasil kompilasi dari source.
 3. **Setiap environment variable dari `.env.example`, skema konfigurasi, atau
-   kode.** Ya. Hanya ada satu: `DSH_HOME`, dan muncul di `lib/index.js:313`.
+   kode.** Ya. Hanya ada satu: `DSH_HOME`, dan muncul di `lib/index.js:860`.
 4. **Setiap port dan URL dari config atau compose.** Ya. `13080` berasal dari dua
    skrip pengukuran. Tidak ada compose file di repo. Path endpoint berasal dari
    `lib/index.js`.

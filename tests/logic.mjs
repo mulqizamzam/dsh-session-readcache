@@ -1,9 +1,9 @@
 import assert from 'node:assert/strict'
-import { mkdtempSync, writeFileSync, appendFileSync, statSync, existsSync, readdirSync } from 'node:fs'
+import { mkdtempSync, writeFileSync, appendFileSync, statSync, existsSync, readdirSync, rmSync, unlinkSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { createRequire } from 'node:module'
-import { apply } from '../lib/index.js'
+import { apply, clock as libClock } from '../lib/index.js'
 
 
 /**
@@ -67,11 +67,24 @@ function makeFake({ listDelayMs = 0 } = {}) {
       },
     },
   }
-  return { ctx, service, live, paths, dir }
+  const metrics = () => {
+    let body
+    ctx.webServer._registeredRoutes
+      .find((r) => r.path === '/plugin/session-readcache/metrics')
+      .handler({}, { writeHead() {}, end(json) { body = JSON.parse(json) } })
+    return body
+  }
+  return { ctx, service, live, paths, dir, metrics }
 }
 
 const tests = []
 function test(label, fn) { tests.push([label, fn]) }
+
+// Hermetic suite: this environment exports DSH_HOME, and without this line the
+// default snapshot path resolves to the LIVE harness snapshot (a real
+// 4006-header file). Tests that exercise persistence pass an explicit
+// snapshotPath under tmpdir(); everything else must not read or touch it.
+delete process.env.DSH_HOME
 
 /** Plant a snapshot row directly, bypassing the plugin's own write path. */
 function plantSnapshot(snapshotPath, headers, savedAt = Date.now()) {
@@ -81,6 +94,101 @@ function plantSnapshot(snapshotPath, headers, savedAt = Date.now()) {
     id INTEGER PRIMARY KEY CHECK (id = 1), saved_at INTEGER NOT NULL, headers TEXT NOT NULL)`)
   db.prepare('INSERT OR REPLACE INTO readcache_list_snapshot VALUES (1, ?, ?)').run(savedAt, JSON.stringify(headers))
   db.close()
+}
+
+/**
+ * Plant a snapshot row with explicit control of the parts the plugin must
+ * refuse: the schema version in the database header and the raw headers text
+ * (which may not be valid JSON at all).
+ */
+function plantRawSnapshot(snapshotPath, { headers, savedAt = Date.now(), userVersion } = {}) {
+  const Database = createRequire(import.meta.url)('better-sqlite3')
+  const db = new Database(snapshotPath)
+  db.exec(`CREATE TABLE IF NOT EXISTS readcache_list_snapshot (
+    id INTEGER PRIMARY KEY CHECK (id = 1), saved_at INTEGER NOT NULL, headers TEXT NOT NULL)`)
+  db.prepare('INSERT OR REPLACE INTO readcache_list_snapshot VALUES (1, ?, ?)')
+    .run(savedAt, typeof headers === 'string' ? headers : JSON.stringify(headers))
+  if (userVersion !== undefined) db.pragma(`user_version = ${userVersion}`)
+  db.close()
+}
+
+/**
+ * A fake service whose sessions cost a configurable number of events, so the
+ * maxEntries / maxTotalEvents bounds can be observed through the metrics route.
+ */
+function makeSizedFake({ cost = 1, ids = ['a', 'b', 'c', 'd', 'e'] } = {}) {
+  const dir = mkdtempSync(join(tmpdir(), 'readcache-sized-'))
+  const paths = {}
+  for (const id of ids) {
+    paths[id] = join(dir, id)
+    writeFileSync(paths[id], 'x'.repeat(Math.max(1, cost)))
+  }
+  const headers = ids.map((id) => ({ id, cwd: '/p1', createdAt: 1 }))
+  let inspectCalls = 0
+  const service = {
+    get inspectCalls() { return inspectCalls },
+    locate: (meta) => ({ kind: 'fake', path: paths[meta.id] }),
+    async inspect(id) {
+      inspectCalls += 1
+      if (paths[id] === undefined) throw new Error(`not found: ${id}`)
+      return { meta: headers.find((h) => h.id === id), events: new Array(cost).fill({ seq: 0, type: 'x' }) }
+    },
+    async list() { return headers.map((h) => ({ ...h })) },
+  }
+  const ctx = {
+    inject: (names, cb) => cb({ sessionPersistence: service, sessions: { get: () => undefined } }),
+    effect: (fn) => fn(),
+    logger: { info: () => {}, warn: () => {} },
+    webServer: {
+      _registeredRoutes: [],
+      register(route) { this._registeredRoutes.push(route); return () => {} },
+    },
+  }
+  const metrics = () => {
+    let body
+    ctx.webServer._registeredRoutes
+      .find((r) => r.path === '/plugin/session-readcache/metrics')
+      .handler({}, { writeHead() {}, end(json) { body = JSON.parse(json) } })
+    return body
+  }
+  return { ctx, service, metrics, paths, dir }
+}
+
+/**
+ * A fake whose ctx exposes the host event bus, so session/disposed can be
+ * driven deterministically (no timers, no real dispose path).
+ */
+function makeLifecycleFake() {
+  const base = makeFake()
+  const listeners = new Map()
+  base.ctx.on = (event, cb) => {
+    const list = listeners.get(event) ?? []
+    list.push(cb)
+    listeners.set(event, list)
+  }
+  const emit = (event, arg) => { for (const cb of listeners.get(event) ?? []) cb(arg) }
+  const metrics = () => {
+    let body
+    base.ctx.webServer._registeredRoutes
+      .find((r) => r.path === '/plugin/session-readcache/metrics')
+      .handler({}, { writeHead() {}, end(json) { body = JSON.parse(json) } })
+    return body
+  }
+  return { ...base, emit, metrics }
+}
+
+/** Run `fn` with the plugin's clocks pinned to fixed values, then restore. */
+async function withClock(fns, fn) {
+  const savedMono = libClock.monotonic
+  const savedWall = libClock.wall
+  libClock.monotonic = fns.monotonic ?? (() => 0)
+  libClock.wall = fns.wall ?? (() => 0)
+  try {
+    return await fn()
+  } finally {
+    libClock.monotonic = savedMono
+    libClock.wall = savedWall
+  }
 }
 
 /** Mount the plugin over a fake service and expose the metrics snapshot. */
@@ -773,6 +881,490 @@ test('inspect: a live session still caches once it detaches', async () => {
   route.handler({}, { writeHead() {}, end(x) { body = x } })
   assert.equal(JSON.parse(body).cache.entries, 1, 'caching resumes after detaching')
   assert.ok(service.listCalls >= 1, 'the detached read does resolve a path')
+})
+
+// --- hardening tests (cache semantics, TTL boundaries, lifecycle, snapshot,
+// config validation, and the fallback contract) -------------------------------
+
+test('inspect: a hit refreshes recency, so the oldest entry is the one evicted', async () => {
+  const { ctx, service } = makeFake()
+  apply(ctx, { maxEntries: 2 })
+  await service.inspect('s1')
+  await service.inspect('s2')
+  await service.inspect('s1') // hit: s1 becomes the newest
+  await service.inspect('s3') // evicts s2, not s1
+  await service.inspect('s1')
+  assert.equal(service.inspectCalls, 3, 'the recently used entry must survive the eviction')
+  await service.inspect('s2')
+  assert.equal(service.inspectCalls, 4, 'the untouched entry was the one dropped')
+})
+
+test('inspect: resident entries never exceed maxEntries', async () => {
+  const { ctx, service, metrics } = makeSizedFake({ ids: ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h'] })
+  apply(ctx, { maxEntries: 3 })
+  for (const id of ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h']) await service.inspect(id)
+  assert.equal(metrics().cache.entries, 3, 'capacity is a hard cap on entry count')
+})
+
+test('inspect: resident events never exceed maxTotalEvents', async () => {
+  const { ctx, service, metrics } = makeSizedFake({ cost: 40, ids: ['a', 'b', 'c', 'd', 'e', 'f'] })
+  apply(ctx, { maxEntries: 16, maxTotalEvents: 100 })
+  for (const id of ['a', 'b', 'c', 'd', 'e', 'f']) await service.inspect(id)
+  const m = metrics()
+  assert.ok(m.cache.totalCost <= 100, `event budget must bound residency (totalCost=${m.cache.totalCost})`)
+  assert.ok(m.cache.entries <= 2, `budget admits at most 2 sessions of 40 events (entries=${m.cache.entries})`)
+})
+
+test('inspect: an attach race with signalled readers does not corrupt the cost accounting', async () => {
+  // Signalled reads are never coalesced, so these 8 callers really do race
+  // through the hit path: the historical defect subtracted one entry's cost
+  // once per racer. No timers — the interleaving comes from the real stat.
+  const { ctx, service, live, metrics } = makeFake()
+  apply(ctx, {})
+  await service.inspect('s1')
+  live.add('s1')
+  const controllers = Array.from({ length: 8 }, () => new AbortController())
+  await Promise.all(controllers.map((ac) => service.inspect('s1', ac.signal)))
+  const m = metrics()
+  assert.equal(m.cache.entries, 0, 'a live session is never cached')
+  assert.equal(m.cache.totalCost, 0, `one entry cost must be subtracted exactly once (totalCost=${m.cache.totalCost})`)
+  assert.equal(m.inspect.liveSkips, 8, 'every racer took the live branch')
+})
+
+test('inspect: concurrent reads of one id fold into one host read, distinct ids do not', async () => {
+  const { ctx, service } = makeFake({ listDelayMs: 20 })
+  apply(ctx, {})
+  const [r1, r2] = await Promise.all([service.inspect('s1'), service.inspect('s1')])
+  assert.equal(r1, r2, 'folded callers share one read')
+  assert.equal(service.inspectCalls, 1, 'one id, one underlying read')
+  await Promise.all([service.inspect('s2'), service.inspect('s3')])
+  assert.equal(service.inspectCalls, 3, 'distinct ids are never folded together')
+})
+
+test('inspect: the in-flight slot is released after success and after failure', async () => {
+  const { ctx, service, metrics } = makeFake()
+  apply(ctx, {})
+  await Promise.all([service.inspect('s1'), service.inspect('s1')])
+  assert.equal(metrics().cache.inflight, 0, 'a settled read leaves no in-flight entry')
+  await assert.rejects(() => service.inspect('nope'), /not found/)
+  assert.equal(metrics().cache.inflight, 0, 'a failed read leaves no in-flight entry either')
+  const again = await service.inspect('s1')
+  assert.equal(again.events.length, 1, 'a later read is not blocked by the failed one')
+})
+
+test('inspect: an empty view is not cached (a partial result is not a result)', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'readcache-empty-'))
+  const path = join(dir, 's1')
+  writeFileSync(path, 'x')
+  let calls = 0
+  const service = {
+    locate: () => ({ kind: 'fake', path }),
+    async inspect() { calls += 1; return { meta: { id: 's1', cwd: '/p1', createdAt: 1 }, events: [] } },
+    async list() { return [{ id: 's1', cwd: '/p1', createdAt: 1 }] },
+  }
+  const ctx = {
+    inject: (names, cb) => cb({ sessionPersistence: service, sessions: { get: () => undefined } }),
+    effect: (fn) => fn(),
+    logger: { info: () => {}, warn: () => {} },
+    webServer: { register: () => () => {} },
+  }
+  apply(ctx, {})
+  await service.inspect('s1')
+  await service.inspect('s1')
+  assert.equal(calls, 2, 'a view with no events must not be memoized')
+})
+
+test('inspect: cache on and cache off return the same data', async () => {
+  const { ctx: ctxA, service: svcA } = makeFake()
+  apply(ctxA, {})
+  const warm = await svcA.inspect('s1')
+  const hot = await svcA.inspect('s1')
+
+  const { ctx: ctxB, service: svcB } = makeFake()
+  apply(ctxB, { enabled: false })
+  const cold = await svcB.inspect('s1')
+
+  assert.deepEqual(hot, cold, 'a cache hit must be functionally identical to an uncached read')
+  assert.deepEqual(warm.meta, cold.meta)
+})
+
+test('inspect: a session that was disposed is re-read from the host', async () => {
+  const { ctx, service, emit, metrics } = makeLifecycleFake()
+  apply(ctx, {})
+  await service.inspect('s1')
+  assert.equal(service.inspectCalls, 1)
+  emit('session/disposed', { id: 's1' })
+  await service.inspect('s1')
+  assert.equal(service.inspectCalls, 2, 'a disposed session must not be served from cache')
+  assert.equal(metrics().cache.entries, 1, 'the fresh post-dispose view is the one cached')
+  await service.inspect('s1')
+  assert.equal(service.inspectCalls, 2, 'and it hits normally afterwards')
+})
+
+test('inspect: a read parked on the stat when the dispose lands delegates to the host', async () => {
+  // The read suspends on its own stat after the entry lookup; the dispose
+  // lands inside that window. The deterministic check is that the parked read
+  // re-enters the host instead of installing the pre-drain view.
+  const { ctx, service, emit, metrics } = makeLifecycleFake()
+  apply(ctx, {})
+  await service.inspect('s1')
+  const parked = service.inspect('s1')
+  emit('session/disposed', { id: 's1' })
+  const served = await parked
+  assert.equal(service.inspectCalls, 2, 'a read parked on the stat must fall through to the host')
+  assert.equal(served.events.length, 1, 'the caller still gets correct data')
+  const m = metrics()
+  assert.equal(m.cache.totalCost, 1, 'the post-dispose read books exactly one cost')
+  assert.equal(m.inspect.stale, 0, 'a lifecycle invalidation is not a stat mismatch')
+})
+
+test('inspect: a deleted log re-reads and the host error still surfaces', async () => {
+  const { ctx, service, paths } = makeFake()
+  apply(ctx, {})
+  await service.inspect('s1')
+  await service.inspect('s1')
+  assert.equal(service.inspectCalls, 1)
+  rmSync(paths.s1, { force: true })
+  delete paths.s1 // the host no longer knows this artifact either
+  await assert.rejects(() => service.inspect('s1'), /not found/)
+  assert.equal(service.inspectCalls, 2, 'a missing file forces a real read')
+})
+
+test('inspect: a recreated log (new inode, same size) invalidates the entry', async () => {
+  const { ctx, service, paths } = makeFake()
+  apply(ctx, {})
+  await service.inspect('s1')
+  const size = statSync(paths.s1).size
+  rmSync(paths.s1, { force: true })
+  writeFileSync(paths.s1, 'y'.repeat(size)) // same length, different inode
+  await service.inspect('s1')
+  assert.equal(service.inspectCalls, 2, 'the identity fields of the file must be part of the key')
+})
+
+test('inspect: the plugin still wraps the service when no webServer exists', async () => {
+  const { ctx, service } = makeFake()
+  delete ctx.webServer
+  const warnings = []
+  ctx.logger = { info: () => {}, warn: (m) => warnings.push(m) }
+  apply(ctx, {})
+  await service.inspect('s1')
+  await service.inspect('s1')
+  assert.equal(service.inspectCalls, 1, 'the cache must work without a web surface')
+  assert.ok(warnings.some((m) => m.includes('webServer')), 'the absence must be observable')
+})
+
+test('list: TTL boundary — just before expiry is a hit, at expiry is a scan', async () => {
+  const { ctx, service } = makeFake()
+  const T0 = 1_000
+  await withClock({ monotonic: () => T0, wall: () => T0 }, async () => {
+    apply(ctx, { listTtlMs: 750, listMaxStaleMs: 0 })
+    await service.list()
+    assert.equal(service.listCalls, 1, 'first call scans')
+  })
+  await withClock({ monotonic: () => T0 + 749, wall: () => T0 + 749 }, async () => {
+    await service.list()
+    assert.equal(service.listCalls, 1, 'one ms before the TTL is still a hit')
+  })
+  await withClock({ monotonic: () => T0 + 750, wall: () => T0 + 750 }, async () => {
+    await service.list()
+    assert.equal(service.listCalls, 2, 'exactly at the TTL the memo is expired')
+  })
+})
+
+test('list: stale window boundary — inside it the last scan is served, past it the caller waits', async () => {
+  const { ctx, service } = makeFake({ listDelayMs: 30 })
+  const T0 = 5_000
+  await withClock({ monotonic: () => T0, wall: () => T0 }, async () => {
+    apply(ctx, { listTtlMs: 750, listMaxStaleMs: 30_000 })
+    await service.list()
+    assert.equal(service.listCalls, 1)
+  })
+  await withClock({ monotonic: () => T0 + 751, wall: () => T0 + 751 }, async () => {
+    const served = await service.list()
+    assert.equal(served.length, 4, 'inside the stale window the last scan is served')
+    assert.equal(service.listCalls, 1, 'and no scan is waited for')
+  })
+  await withClock({ monotonic: () => T0 + 750 + 30_000, wall: () => T0 + 750 + 30_000 }, async () => {
+    const served = await service.list()
+    assert.equal(served.length, 4)
+    assert.equal(service.listCalls, 2, 'past the stale window the caller pays for a real scan')
+  })
+})
+
+test('list: a backwards wall-clock step cannot extend the memo', async () => {
+  const { ctx, service } = makeFake()
+  apply(ctx, { listTtlMs: 750, listMaxStaleMs: 0 })
+  let mono = 10_000
+  let wall = 10_000
+  await withClock({ monotonic: () => mono, wall: () => wall }, async () => {
+    await service.list()
+    assert.equal(service.listCalls, 1)
+  })
+  // The wall clock jumps back an hour; monotonic time keeps moving forward.
+  wall -= 3_600_000
+  mono += 749
+  await withClock({ monotonic: () => mono, wall: () => wall }, async () => {
+    await service.list()
+    assert.equal(service.listCalls, 1, 'a backwards clock step must not make the memo fresher')
+  })
+  mono += 1
+  await withClock({ monotonic: () => mono, wall: () => wall }, async () => {
+    await service.list()
+    assert.equal(service.listCalls, 2, 'the TTL still expires on monotonic time')
+  })
+})
+
+test('snapshot: a row written by an unknown schema version is refused', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'readcache-ver-'))
+  const snapPath = join(dir, 's.db')
+  plantRawSnapshot(snapPath, { headers: [{ id: 'x', cwd: '/p', createdAt: 1 }], userVersion: 99 })
+  const m = mountSnapshot({ snapshotPath: snapPath, snapshotMaxAgeMs: 600_000, listTtlMs: 750 })
+  const served = await m.service.list()
+  assert.equal(served[0]?.id, 's1', 'an incompatible row must not seed the memo')
+  assert.equal(m.calls(), 1, 'the real scan runs instead')
+  assert.ok(m.snapshot().notes.some((n) => n.includes('schema version')), 'the refusal is reported')
+})
+
+test('snapshot: a saved_at from the future is refused', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'readcache-future-'))
+  const snapPath = join(dir, 's.db')
+  const future = Date.now() + 10 * 60_000
+  plantSnapshot(snapPath, [{ id: 'x', cwd: '/p', createdAt: 1 }], future)
+  const m = mountSnapshot({ snapshotPath: snapPath, snapshotMaxAgeMs: 600_000, listTtlMs: 750 })
+  const served = await m.service.list()
+  assert.equal(served[0]?.id, 's1', 'a future stamp must not be able to skip the age gate')
+  assert.equal(m.calls(), 1)
+  assert.ok(m.snapshot().notes.some((n) => n.includes('future')), 'the refusal is reported')
+})
+
+test('snapshot: an oversized row is refused without being materialised', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'readcache-big-'))
+  const snapPath = join(dir, 's.db')
+  // Past the 8 MiB bound the row must be refused by its measured length, not
+  // parsed: fat ids keep the fixture small in element count.
+  const fat = Array.from({ length: 20_000 }, (_, i) => ({ id: `s${i}${'x'.repeat(600)}`, cwd: '/p', createdAt: 1 }))
+  plantSnapshot(snapPath, fat)
+  assert.ok(statSync(snapPath).size > 8 * 1024 * 1024, 'the fixture must actually exceed the bound')
+  const m = mountSnapshot({ snapshotPath: snapPath, snapshotMaxAgeMs: 600_000, listTtlMs: 750 })
+  const served = await m.service.list()
+  assert.equal(served[0]?.id, 's1', 'the fat row must not be served')
+  assert.equal(m.calls(), 1)
+  assert.ok(m.snapshot().notes.some((n) => n.includes('too large')), 'the refusal is reported')
+})
+
+test('snapshot: a row holding a prototype-reaching key is refused', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'readcache-proto-'))
+  const snapPath = join(dir, 's.db')
+  // JSON.parse gives this element an OWN __proto__ data property.
+  plantRawSnapshot(snapPath, { headers: [{ id: 'x', cwd: '/p', createdAt: 1 }] })
+  const Database = createRequire(import.meta.url)('better-sqlite3')
+  const crafted = [{ id: 'x', cwd: '/p', createdAt: 1 }]
+  Object.defineProperty(crafted[0], '__proto__', { value: { polluted: 'yes' }, enumerable: true })
+  const db = new Database(snapPath)
+  db.prepare('UPDATE readcache_list_snapshot SET headers = ? WHERE id = 1').run(JSON.stringify(crafted))
+  db.close()
+  const m = mountSnapshot({ snapshotPath: snapPath, snapshotMaxAgeMs: 600_000, listTtlMs: 750 })
+  const served = await m.service.list()
+  assert.equal(served[0]?.id, 's1', 'a crafted row must not be served')
+  assert.equal(m.calls(), 1)
+  assert.ok(m.snapshot().notes.some((n) => n.includes('not session headers')), 'the refusal is reported')
+})
+
+test('list: a served header copy cannot carry a prototype-reaching key', async () => {
+  // The live-scan path: a header that somehow holds an own __proto__ must not
+  // survive the copy into the caller's object.
+  const dir = mkdtempSync(join(tmpdir(), 'readcache-protocopy-'))
+  const path = join(dir, 's1')
+  writeFileSync(path, 'x')
+  const crafted = [{ id: 's1', cwd: '/p1', createdAt: 1 }]
+  Object.defineProperty(crafted[0], '__proto__', { value: { polluted: 'yes' }, enumerable: true })
+  const service = {
+    locate: () => ({ kind: 'fake', path }),
+    async inspect() { return { meta: { id: 's1', cwd: '/p1', createdAt: 1 }, events: [{ seq: 0, type: 'x' }] } },
+    async list() { return crafted },
+  }
+  const ctx = {
+    inject: (names, cb) => cb({ sessionPersistence: service, sessions: { get: () => undefined } }),
+    effect: (fn) => fn(),
+    logger: { info: () => {}, warn: () => {} },
+    webServer: { register: () => () => {} },
+  }
+  apply(ctx, { listTtlMs: 10_000 })
+  const served = await service.list()
+  assert.equal(served[0].id, 's1')
+  assert.equal(Object.prototype.hasOwnProperty.call(served[0], '__proto__'), false, 'the key must not be copied')
+  assert.equal({}.polluted, undefined, 'and nothing reaches the prototype')
+})
+
+test('snapshot: a locked database is recorded and list() still answers', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'readcache-lock-'))
+  const snapPath = join(dir, 's.db')
+  plantSnapshot(snapPath, [{ id: 'x', cwd: '/p', createdAt: 1 }])
+  const Database = createRequire(import.meta.url)('better-sqlite3')
+  const blocker = new Database(snapPath)
+  blocker.exec('BEGIN EXCLUSIVE') // another writer holds the database
+  const { ctx, service } = makeFake()
+  const metrics = () => {
+    let body
+    ctx.webServer._registeredRoutes
+      .find((r) => r.path === '/plugin/session-readcache/metrics')
+      .handler({}, { writeHead() {}, end(json) { body = JSON.parse(json) } })
+    return body
+  }
+  apply(ctx, { snapshotPath: snapPath, listTtlMs: 750 })
+  const served = await service.list()
+  assert.equal(served.length, 4, 'the read path never depends on the snapshot writer')
+  const deadline = Date.now() + 12_000
+  while (metrics().snapshot.failures === 0 && Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 100))
+  }
+  assert.ok(metrics().snapshot.failures >= 1, 'the locked write must be observable, not silent')
+  blocker.exec('ROLLBACK')
+  blocker.close()
+})
+
+test('snapshot: an unwritable snapshot location is recorded and list() still answers', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'readcache-ro-'))
+  const blockerFile = join(dir, 'blocker')
+  writeFileSync(blockerFile, 'x')
+  const { ctx, service } = makeFake()
+  const metrics = () => {
+    let body
+    ctx.webServer._registeredRoutes
+      .find((r) => r.path === '/plugin/session-readcache/metrics')
+      .handler({}, { writeHead() {}, end(json) { body = JSON.parse(json) } })
+    return body
+  }
+  // A file where a directory is expected: mkdir fails for the writer.
+  apply(ctx, { snapshotPath: join(blockerFile, 'snap.db'), listTtlMs: 0, listMaxStaleMs: 0 })
+  const served = await service.list()
+  assert.equal(served.length, 4, 'a failed snapshot write must not affect the reply')
+  const deadline = Date.now() + 5_000
+  while (metrics().snapshot.failures === 0 && Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 50))
+  }
+  assert.ok(metrics().snapshot.failures >= 1, 'the write failure must be observable')
+})
+
+test('snapshot: repeated failed writes cannot grow the notes array without bound', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'readcache-notes-'))
+  const blockerFile = join(dir, 'blocker')
+  writeFileSync(blockerFile, 'x')
+  const { ctx, service } = makeFake()
+  const metrics = () => {
+    let body
+    ctx.webServer._registeredRoutes
+      .find((r) => r.path === '/plugin/session-readcache/metrics')
+      .handler({}, { writeHead() {}, end(json) { body = JSON.parse(json) } })
+    return body
+  }
+  apply(ctx, { snapshotPath: join(blockerFile, 'snap.db'), listTtlMs: 0, listMaxStaleMs: 0 })
+  for (let i = 0; i < 30; i += 1) await service.list()
+  await new Promise((r) => setTimeout(r, 100))
+  const m = metrics()
+  assert.ok(m.snapshot.failures >= 25, `every failed write is counted (${m.snapshot.failures})`)
+  assert.ok(m.snapshot.notes.length <= 20, `notes stay bounded (${m.snapshot.notes.length})`)
+})
+
+test('inspect: a session id carrying SQL metacharacters is only ever a value', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'readcache-sqli-'))
+  const evil = "s1'); DROP TABLE readcache_list_snapshot; --"
+  const path = join(dir, 'log')
+  writeFileSync(path, 'x')
+  const service = {
+    locate: () => ({ kind: 'fake', path }),
+    async inspect(id) {
+      if (id !== evil) throw new Error(`not found: ${id}`)
+      return { meta: { id, cwd: '/p1', createdAt: 1 }, events: [{ seq: 0, type: 'x' }] }
+    },
+    async list() { return [{ id: evil, cwd: '/p1', createdAt: 1 }] },
+  }
+  const ctx = {
+    inject: (names, cb) => cb({ sessionPersistence: service, sessions: { get: () => undefined } }),
+    effect: (fn) => fn(),
+    logger: { info: () => {}, warn: () => {} },
+    webServer: { register: () => () => {} },
+  }
+  const snapPath = join(dir, 'snap.db')
+  apply(ctx, { snapshotPath: snapPath, listTtlMs: 10_000 })
+  const first = await service.inspect(evil)
+  const second = await service.inspect(evil)
+  assert.equal(first, second, 'the read is cached normally')
+  await new Promise((r) => setTimeout(r, 50)) // let the snapshot write land
+  const row = dbRow(snapPath)
+  assert.ok(row !== undefined, 'the snapshot table survived: the id was never interpolated into SQL')
+  const listed = await service.list()
+  assert.equal(listed[0].id, evil, 'the value round-trips as data')
+})
+
+test('config: invalid values fall back to the documented defaults and say so', async () => {
+  const warnings = []
+  const { ctx, service } = makeFake()
+  ctx.logger = { info: () => {}, warn: (m) => warnings.push(m) }
+  apply(ctx, { maxEntries: '8', maxTotalEvents: 1.5, listTtlMs: -1, listMaxStaleMs: NaN, snapshotMaxAgeMs: null })
+  for (const key of ['maxEntries', 'maxTotalEvents', 'listTtlMs', 'listMaxStaleMs', 'snapshotMaxAgeMs']) {
+    assert.ok(warnings.some((m) => m.includes(key)), `${key} must be named in the warning`)
+  }
+  // The defaults are what actually take effect: 24 entries admits all four.
+  for (const id of ['s1', 's2', 's3', 's4']) await service.inspect(id)
+  const routes = ctx.webServer._registeredRoutes
+  let body
+  routes.find((r) => r.path === '/plugin/session-readcache/metrics')
+    .handler({}, { writeHead() {}, end(json) { body = JSON.parse(json) } })
+  assert.equal(body.cache.coalesceLimit, 24, 'the coalescing limit follows the effective maxEntries')
+  assert.equal(body.cache.entries, 4, 'all four entries fit under the default capacity')
+})
+
+test('config: boundary values are accepted and keep their meaning', async () => {
+  const { ctx, service } = makeFake({ listDelayMs: 10 })
+  apply(ctx, {
+    maxEntries: 1,
+    maxTotalEvents: Number.MAX_SAFE_INTEGER,
+    listTtlMs: 0,
+    listMaxStaleMs: 0,
+    snapshotMaxAgeMs: 0,
+  })
+  // list() first: a cold inspect resolves its log path through the same memo,
+  // so mixing the two counts the path lookups as scans.
+  await service.list()
+  await service.list()
+  assert.equal(service.listCalls, 2, 'listTtlMs 0 is strict TTL, every call scans')
+  await service.inspect('s1')
+  await service.inspect('s2')
+  assert.equal(service.inspectCalls, 2, 'maxEntries 1 still caches one entry')
+  await service.inspect('s1')
+  assert.equal(service.inspectCalls, 3, 'and evicts it on the next id')
+})
+
+test('config: enabled false disables the plugin; a non-boolean enabled does not', async () => {
+  const { ctx: ctxOff, service: svcOff } = makeFake()
+  const infos = []
+  ctxOff.logger = { info: (m) => infos.push(m), warn: () => {} }
+  apply(ctxOff, { enabled: false })
+  await svcOff.inspect('s1')
+  await svcOff.inspect('s1')
+  assert.equal(svcOff.inspectCalls, 2, 'nothing is wrapped when disabled')
+  assert.ok(infos.some((m) => m.includes('disabled by config')))
+
+  const warnings = []
+  const { ctx: ctxOdd, service: svcOdd } = makeFake()
+  ctxOdd.logger = { info: () => {}, warn: (m) => warnings.push(m) }
+  apply(ctxOdd, { enabled: 'false' })
+  await svcOdd.inspect('s1')
+  await svcOdd.inspect('s1')
+  assert.equal(svcOdd.inspectCalls, 1, 'only the exact value false disables the plugin')
+  assert.ok(warnings.some((m) => m.includes('enabled is not a boolean')), 'and the odd value is reported')
+})
+
+test('cache: a bookkeeping failure never breaks the read', async () => {
+  const { ctx, service } = makeFake()
+  // locate() throwing is the bookkeeping layer failing in the worst way.
+  service.locate = () => { throw new Error('locate exploded') }
+  apply(ctx, {})
+  const view = await service.inspect('s1')
+  assert.equal(view.events.length, 1, 'the read still returns the host answer')
+  const listed = await service.list()
+  assert.equal(listed.length, 4, 'list() is unaffected too')
 })
 
 let failed = 0
