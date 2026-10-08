@@ -1367,6 +1367,63 @@ test('cache: a bookkeeping failure never breaks the read', async () => {
   assert.equal(listed.length, 4, 'list() is unaffected too')
 })
 
+test('snapshot: an oversized scan is not persisted and list() still answers', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'readcache-bigsave-'))
+  const snapPath = join(dir, 'snap.db')
+  const fat = Array.from({ length: 20_000 }, (_, i) => ({ id: `s${i}${'x'.repeat(600)}`, cwd: '/p', createdAt: 1 }))
+  const service = {
+    locate: () => ({ kind: 'fake', path: '/x' }),
+    async inspect() { return { meta: {}, events: [] } },
+    async list() { return fat },
+  }
+  const routes = []
+  const ctx = {
+    inject: (names, cb) => cb({ sessionPersistence: service, sessions: { get: () => undefined } }),
+    effect: (fn) => fn(),
+    logger: { info: () => {}, warn: () => {} },
+    webServer: { register(r) { routes.push(r); return () => {} } },
+  }
+  apply(ctx, { snapshotPath: snapPath, listTtlMs: 750 })
+  const served = await service.list()
+  assert.equal(served.length, 20_000, 'the caller still gets every header')
+  await new Promise((r) => setTimeout(r, 150)) // the background write settles here
+  let body
+  routes.find((r) => r.path === '/plugin/session-readcache/metrics')
+    .handler({}, { writeHead() {}, end(json) { body = JSON.parse(json) } })
+  assert.equal(body.snapshot.failures, 1, `the oversized write must be reported (failures=${body.snapshot.failures})`)
+  assert.ok(body.snapshot.notes.some((n) => n.includes('too large to persist')), 'with the reason')
+  assert.equal(dbRow(snapPath), undefined, 'and nothing oversized is ever written')
+})
+
+test('snapshot: a bound measured in bytes, not characters, matches the loader', async () => {
+  // A header whose UTF-8 length exceeds its character length must be refused by
+  // the SAME bound the loader applies, or the writer persists rows the loader
+  // will never serve.
+  const dir = mkdtempSync(join(tmpdir(), 'readcache-utf8-'))
+  const snapPath = join(dir, 'snap.db')
+  const filler = 'ü'.repeat(4_200_000) // 4.2M chars, 8.4M UTF-8 bytes
+  const service = {
+    locate: () => ({ kind: 'fake', path: '/x' }),
+    async inspect() { return { meta: {}, events: [] } },
+    async list() { return [{ id: 's1', cwd: filler, createdAt: 1 }] },
+  }
+  const routes = []
+  const ctx = {
+    inject: (names, cb) => cb({ sessionPersistence: service, sessions: { get: () => undefined } }),
+    effect: (fn) => fn(),
+    logger: { info: () => {}, warn: () => {} },
+    webServer: { register(r) { routes.push(r); return () => {} } },
+  }
+  apply(ctx, { snapshotPath: snapPath, listTtlMs: 750 })
+  await service.list()
+  await new Promise((r) => setTimeout(r, 150))
+  let body
+  routes.find((r) => r.path === '/plugin/session-readcache/metrics')
+    .handler({}, { writeHead() {}, end(json) { body = JSON.parse(json) } })
+  assert.equal(body.snapshot.failures, 1, 'a char-counting writer would have persisted this row')
+  assert.equal(dbRow(snapPath), undefined)
+})
+
 let failed = 0
 for (const [label, fn] of tests) {
   try { await fn(); console.log(`PASS ${label}`) }
