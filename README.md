@@ -366,21 +366,27 @@ Repo ini bukan aplikasi mandiri. Ia adalah plugin yang di-host oleh
 
 ### 6.1 Perintah boot host
 
-Bentuk perintah yang benar dapat diambil dari `tests/runtime-smoke.mjs:60-62`, yang
-menjalankan binary CLI host dengan argumen berikut: `web`, `--profile web`,
-`--port`, `--no-open`:
+Bentuk perintah yang benar dapat diambil dari `tests/runtime-smoke.mjs:62-63`, yang
+menjalankan binary CLI host dengan argumen berikut: `web`, `--port 0`,
+`--no-open`:
 
 ```bash
-dsh web --profile web --port 13080 --no-open
+dsh web --port 13080 --no-open
 ```
 
 Catatan tentang tiap bagian perintah ini:
 
-- `--profile web` dipakai oleh test smoke, jadi nama profilnya memang `web`
-  (`tests/runtime-smoke.mjs:61`).
+- Profil dipilih oleh sub-perintah `web` itu sendiri. Host memperlakukan
+  `dsh web` sama dengan `dsh --profile web`: token aplikasi di awal argv
+  diperluas menjadi `--profile <nama>` (sumber: `apps/cli/src/args.ts` di
+  checkout host, perluas `['--profile', ...argv]`). Karena itu
+  `dsh web --profile web ...` **ditolak** host dengan pesan
+  `select a profile only once` — profil terpilih dua kali dan child host mati
+  sebelum boot. Bentuk setara yang valid: `dsh --profile web --port 13080
+  --no-open`.
 - `--port 13080` adalah port yang dipakai script pengukuran di repo ini
   (`smoke-test.mjs:18` dan `measure-e2e.mjs:4` menuliskan
-  `http://127.0.0.1:13080`). `tests/runtime-smoke.mjs:62` memakai `--port 0`,
+  `http://127.0.0.1:13080`). `tests/runtime-smoke.mjs:63` memakai `--port 0`,
   yang berarti OS memilih port sendiri. Kedua bentuk itu valid; angka 13080 bukan
   default yang dipatok plugin.
 - `--no-open` mencegah host membuka browser sendiri.
@@ -401,7 +407,7 @@ Plugin memberi dua tanda bahwa ia benar-benar terpasang:
    ```
 
    Baris ini ditulis dua kali, sekali ke `process.stderr` dan sekali ke
-   `ctx.logger`. String persis yang dicari ada di `tests/runtime-smoke.mjs:82`:
+   `ctx.logger`. String persis yang dicari ada di `tests/runtime-smoke.mjs:83`:
    `out.includes('[session-readcache] mounted')`.
 
 2. Endpoint metrics menjawab dengan JSON. Perintah dan bentuk responsnya ada di
@@ -714,12 +720,12 @@ eksplisit, jadi kegagalan berupa exception yang tidak tertangani.
 
 | File | Jumlah test | Cara tahu |
 | --- | --- | --- |
-| `tests/logic.mjs` | 70 | Dihitung dari 70 pemanggilan `test(...)` di file |
+| `tests/logic.mjs` | 73 | Dihitung dari 73 pemanggilan `test(...)` di file |
 | `tests/subagent-signal.mjs` | 8 | Dihitung dari 8 pemanggilan `test(...)` di file |
 | `tests/realfile.mts` | Bukan suite | 5 assertion, tidak punya label test |
 
 Jumlah dihitung dari isi file, bukan dari hasil eksekusi pada sesi penulisan
-dokumen ini. Eksekusi terakhir yang tercatat: `ALL 70 PASS`, `ALL 8 PASS`, dan
+dokumen ini. Eksekusi terakhir yang tercatat: `ALL 73 PASS`, `ALL 8 PASS`, dan
 `ALL PASS` untuk ketiga file itu (lihat bagian 10.6 untuk apa yang belum
 terverifikasi).
 
@@ -854,6 +860,14 @@ lewati bagian ini:
   jangan dijadikan bukti perilaku plugin; bukti mount ada di
   `artifacts/probe-mount.mjs` dan `artifacts/verify-h03-race.mjs` yang memasang
   plugin di atas service host nyata.
+- Cacat argumen CLI yang sudah diperbaiki: spawn di berkas ini dulu mengirim
+  `web --profile web` sekaligus, dan launcher host menolaknya dengan
+  `select a profile only once` (`apps/cli/src/args.ts` memperluas token `web`
+  menjadi `--profile web`), jadi child mati sebelum boot apa pun. Diperbaiki pada
+  2026-10-09; argumen baru diverifikasi lewat parser host sendiri (mode
+  `profile`, profil `web`) dan bentuk argv-nya dikunci oleh test regresi di
+  `tests/logic.mjs`. Kegagalan `FiberState` di lingkungan ini tetap terpisah dari
+  cacat itu.
 
 ---
 
@@ -1391,14 +1405,14 @@ Bukan bagian untuk pembaca umum.
   ditelusuri ke baris yang disebut.
 - Port `13080`, dari `smoke-test.mjs:18` dan `measure-e2e.mjs:4`.
 - Path endpoint metrics dan purge, dari `lib/index.js:701` dan `501`.
-- Jumlah test 41 dan 8, dengan cara hit yang dinyatakan di bagian 10.3.
+- Jumlah test 73 dan 8, dengan cara hit yang dinyatakan di bagian 10.3.
 
 **Inferred**, ditulis dengan label eksplisit:
 
 - `pnpm install` sebagai perintah install, diturunkan dari keberadaan
   `pnpm-lock.yaml`. Dinyatakan di bagian 3.1 dan 9.1.
-- Gabungannya `dsh web --profile web --port 13080 --no-open` di bagian 6.1.
-  Flag-flagnya observed dari `tests/runtime-smoke.mjs:60-62`; angka `13080` berasal
+- Gabungannya `dsh web --port 13080 --no-open` di bagian 6.1.
+  Flag-flagnya observed dari `tests/runtime-smoke.mjs:62-63`; angka `13080` berasal
   dari konvensi pengukuran, bukan default host.
 - Blok YAML di bagian 4, disusun ulang dari baris `insert` yang ada di
   `cordis.patch.yml` tanpa mengubah nilai.

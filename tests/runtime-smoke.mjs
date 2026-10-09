@@ -55,10 +55,11 @@ async function main() {
 
   try {
     // Launch isolated dsh web with same effective config
-    // The bundle patch from dsh-session-readcache will apply automatically
+    // The bundle patch from dsh-session-readcache will apply automatically.
+    // No `--profile web`: the launcher expands the leading `web` token into
+    // `--profile web` itself, then rejects the explicit flag as a duplicate.
     child = spawn(process.execPath,
       ['--import', tsxLoader, join(REPO_ROOT, 'apps/cli/src/bin.ts'), 'web',
-       '--profile', 'web',
        '--port', '0', '--no-open'],
       {
         cwd: workspace,

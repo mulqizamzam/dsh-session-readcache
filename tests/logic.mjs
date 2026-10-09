@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { mkdtempSync, writeFileSync, appendFileSync, statSync, existsSync, readdirSync, rmSync, unlinkSync } from 'node:fs'
+import { mkdtempSync, writeFileSync, appendFileSync, statSync, existsSync, readdirSync, rmSync, unlinkSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { createRequire } from 'node:module'
@@ -1422,6 +1422,32 @@ test('snapshot: a bound measured in bytes, not characters, matches the loader', 
     .handler({}, { writeHead() {}, end(json) { body = JSON.parse(json) } })
   assert.equal(body.snapshot.failures, 1, 'a char-counting writer would have persisted this row')
   assert.equal(dbRow(snapPath), undefined)
+})
+
+test('runtime-smoke: the host child argv selects the profile at most once', () => {
+  // Regression, measured on 2026-10-09: the spawn used to carry `web --profile
+  // web`. The host launcher expands a leading app-name token into `--profile
+  // <name>` itself (apps/cli/src/args.ts: ["--profile", ...argv]), and its
+  // selectProfile collector rejects a second selection with "select a profile
+  // only once" — the child exited 1 before boot, so the smoke test could never
+  // observe a mount banner. The check models that expansion on the real spawn
+  // source: everything after the host script path is the launcher argv.
+  const source = readFileSync(new URL('./runtime-smoke.mjs', import.meta.url), 'utf8')
+  const spawn = source.match(/spawn\(process\.execPath,\s*\[([\s\S]*?)\]/)
+  assert.ok(spawn, 'the host child spawn was found')
+  // Split on the whole quoted script path: cutting inside the literal would
+  // leave a stray quote and shift every token pairing after it.
+  const afterScript = spawn[1].split("'apps/cli/src/bin.ts'")[1]
+  assert.ok(afterScript !== undefined, 'the spawn argv carries the host script path')
+  const launcherArgv = [...afterScript.matchAll(/'([^']*)'/g)].map((match) => match[1])
+  assert.ok(launcherArgv.length > 0, 'the host child argv has literal tokens')
+  const implicit = !launcherArgv[0].startsWith('-') && launcherArgv[0] !== 'plugin' ? 1 : 0
+  const explicit = launcherArgv.filter((token) => token === '--profile').length
+  assert.ok(
+    implicit + explicit <= 1,
+    `the host child argv selects the profile ${implicit + explicit} times; the launcher rejects a second selection: ${JSON.stringify(launcherArgv)}`,
+  )
+  assert.equal(launcherArgv[0], 'web', 'the smoke test boots the web profile')
 })
 
 let failed = 0
