@@ -89,6 +89,14 @@ jalur subagent. Lengan A di atas membuktikan guard bekerja ketika para racer
 benar-benar ada — yang persis kondisi dua pemanggil itu — tapi belum membuktikan
 keduanya pernah sampai ke sana dalam pemakaian nyata.
 
+> **Catatan 2026-10-10.** Bagian 4 dan 5 di atas menggambarkan lapisan cache
+> `inspect` yang sudah tidak ada pada plugin ini. Pada host `0.2.0-rc.2`,
+> `persistence.inspect` dihapus dari service dan baca satu sesi pindah ke
+> `sessionQuery.observeSession` (host membawa cache sendiri, kapasitas 5),
+> sehingga tidak ada lagi coalescing atau guard `AbortSignal` milik plugin untuk
+> diuji: `tests/subagent-signal.mjs` dihapus pada tanggal yang sama. Bagian ini
+> disimpan sebagai catatan sejarah, bukan deskripsi perilaku plugin kini.
+
 ## 5. Koreksi terhadap pengukuran sendiri
 
 Sebelumnya dilaporkan: "6 RPC dengan signal menghasilkan 0 `ENTER` di

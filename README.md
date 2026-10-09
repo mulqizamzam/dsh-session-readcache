@@ -32,14 +32,22 @@ Cache baca (_read cache_) untuk membuka sesi di DSH.
 ## 1. Ringkasan
 
 `dsh-session-readcache` adalah plugin (_add-on_) untuk DeepSeek Harness yang memasang
-sebuah cache baca di depan dua method baca pada service `sessionPersistence` milik
-host, yaitu `inspect()` dan `list()`. Plugin ini tidak mengubah kode host sama sekali.
+sebuah cache baca di depan satu method baca pada service `sessionPersistence` milik
+host, yaitu `list()`. Plugin ini tidak mengubah kode host sama sekali.
+
+**Sejarah singkat yang wajib diketahui:** versi pertama plugin membungkus `inspect()`
+dan `list()`. Pada host `0.2.0-rc.2` method `inspect` dihapus dari service
+(`sessionPersistence` sekarang hanya punya `list`; baca satu sesi pindah ke
+`sessionQuery.observeSession`, dan host sudah membawa cache sendiri untuk jalur itu,
+di-key revisi `stat`, berkapasitas 5). Versi plugin sejak 2026-10-10 karena itu
+hanya membungkus `list()`, dan kegagalan-mount diam-diam pada host lama sudah
+ditutup dengan mode `inert` yang tetap memasang route metrics.
 
 Istilah yang perlu diketahui sebelum lanjut:
 
 | Istilah | Arti |
 | --- | --- |
-| **Detached (cold) session** | Sesi yang tidak sedang aktif di host. Plugin ini hanya menyimpan cache untuk sesi yang **tidak sedang aktif**, karena event dari sesi aktif berubah terus di memori dan tidak boleh disimpan. |
+| **Scan direktori** | `list()` membaca seluruh direktori sesi dan mengurai header tiap sesi. Pada host ini scan itu berlangsung detik-detik (3,8 ribu log terukur ~9,7 detik), dan itulah yang di-cache plugin. |
 | **LRU (least-recently-used)** | Algoritma eviction: elemen yang paling lama tidak diakses akan dibuang lebih dulu ketika cache penuh. |
 | **stat / revisi file** | Pembacaan metadata file (ukuran, waktu modifikasi, inode). Plugin memakai `stat` sebelum membaca file, sehingga data yang sudah dibaca bisa dicocokkan dengan kondisi file saat ini. |
 | **TTL (time to live)** | Lama waktu sebuah hasil cache dianggap masih segar sebelum harus dihitung ulang. |
@@ -51,16 +59,13 @@ Istilah yang perlu diketahui sebelum lanjut:
 
 Yang ditambahkan plugin, semuanya dari `lib/index.js`:
 
-- Cache `inspect` dengan kapasitas lebih besar dari cache bawaan host, divalidasi
-  dengan satu `stat` per hit. Sumber nilai default: `lib/index.js:20-34`.
 - Memo `list` ber-TTL pendek dengan penggabungan permintaan (_coalescing_) yang
-  sedang berjalan.
+  sedang berjalan. Sumber nilai default: `lib/index.js:20-34`.
 - Jendela stale untuk `list`, supaya pemanggil tidak menunggu scan yang memakan
   detik-detik.
-- Invalidasi saat **sesi dibuang** (`session/disposed`): entri cache dijatahkan
-  sebelum host selesai menulis event terakhir sesi itu, sehingga plugin tidak
-  pernah mengembalikan view yang host sendiri tidak akan kembalikan
-  (`lib/index.js:679-694`).
+- Invalidasi saat **sesi dibuang** (`session/disposed`): memo dibuang, sehingga
+  daftar berikutnya memindai ulang dan tidak pernah mengembalikan baris untuk sesi
+  yang sudah tidak ada di store.
 - Snapshot SQLite dari scan terakhir, supaya restart tidak membayar scan penuh
   untuk reply pertamanya.
 - Dua endpoint HTTP pada web server host untuk melihat penghitung (_metrics_) dan
@@ -205,8 +210,8 @@ Semua kunci opsional. Nilai di bawah adalah default yang tertera di
 | Kunci | Default | Fungsi | Boleh 0? |
 | --- | --- | --- | --- |
 | `enabled` | `true` | `false` menonaktifkan plugin tanpa uninstall: `apply()` langsung keluar dan tidak membungkus apa pun (`lib/index.js:247-249`) | tidak, nilai selain `false` diperlakukan aktif |
-| `maxEntries` | `24` | Kapasitas LRU cache `inspect` | tidak, nilai bukan positive integer akan jatuh ke default (`lib/index.js:53-60`) |
-| `maxTotalEvents` | `250000` | Total anggaran event terparse untuk seluruh entri cache | tidak, lihat `lib/index.js:53-60` |
+| `maxEntries` | `24` | **Inert sejak 2026-10-10** (dulu kapasitas LRU cache `inspect`); tetap divalidasi dan dilaporkan di metrics | tidak, nilai bukan positive integer akan jatuh ke default (`lib/index.js:53-60`) |
+| `maxTotalEvents` | `250000` | **Inert sejak 2026-10-10** (dulu anggaran event cache); tetap divalidasi dan dilaporkan | tidak, lihat `lib/index.js:53-60` |
 | `listTtlMs` | `750` | Selama jendela ini hasil scan `list()` dianggap segar dan dilayani sebagai hit | ya, `0` membuat memo selalu basi (`lib/index.js:53-60`) |
 | `listMaxStaleMs` | `30000` | Setelah TTL habis tapi masih di dalam jendela ini, hasil scan terakhir dikembalikan sambil refresh berjalan di belakang | ya, `0` mempertahankan perilaku TTL ketat (`lib/index.js:53-60`) |
 | `snapshotMaxAgeMs` | `600000` | Umur maksimum snapshot yang boleh mengisi memo saat boot | ya, `0` mematikan boot seeding (`lib/index.js:53-60`) |
@@ -384,11 +389,14 @@ Catatan tentang tiap bagian perintah ini:
   `select a profile only once` — profil terpilih dua kali dan child host mati
   sebelum boot. Bentuk setara yang valid: `dsh --profile web --port 13080
   --no-open`.
-- `--port 13080` adalah port yang dipakai script pengukuran di repo ini
-  (`smoke-test.mjs:18` dan `measure-e2e.mjs:4` menuliskan
-  `http://127.0.0.1:13080`). `tests/runtime-smoke.mjs:63` memakai `--port 0`,
-  yang berarti OS memilih port sendiri. Kedua bentuk itu valid; angka 13080 bukan
-  default yang dipatok plugin.
+- Port hanya relevansi untuk pengujian. `tests/runtime-smoke.mjs` memakai
+  `--port 0`, yang berarti OS memilih port sendiri dan host mencetak URL dengan
+  port tersebut di baris `dsh web: http://...`. Angka 13080 yang sering muncul di
+  dokumen lama adalah port host pengembangan, bukan default yang dipatok plugin.
+  Skrip pengukuran lama yang memakai port tetap (`smoke-test.mjs`,
+  `measure-e2e.mjs`) sudah dihapus karena jalur RPC-nya (`POST /api/<method>`)
+  tidak ada lagi di host 0.2.0-rc.2: RPC sekarang berjalan di atas WebSocket
+  `connection`.
 - `--no-open` mencegah host membuka browser sendiri.
 
 **Perlu dikonfirmasi:** nilai default port milik `dsh web` itu sendiri tidak
@@ -441,36 +449,38 @@ Contoh lengkap dari start sampai melihat bukti plugin bekerja.
 curl http://127.0.0.1:13080/plugin/session-readcache/metrics
 ```
 
-Bentuk responsnya diambil dari handler di `lib/index.js:705-734`:
+Bentuk responsnya diambil dari handler di `lib/index.js`:
 
 ```json
 {
-  "inspect": { "hits": 0, "misses": 0, "stale": 0, "liveSkips": 0 },
+  "mode": "list-memo",
   "list": { "hits": 0, "misses": 0, "staleServed": 0 },
-  "cache": { "entries": 0, "totalCost": 0, "inflight": 0, "coalesceLimit": 24 },
+  "lifecycle": { "disposedDrops": 0, "purgeDrops": 0 },
+  "memo": { "warm": false, "ageMs": null, "inflight": false },
+  "config": { "maxEntries": 24, "listTtlMs": 750, "listMaxStaleMs": 30000, "snapshotMaxAgeMs": 600000, "maxTotalEvents": 250000 },
   "snapshot": { "path": null, "seedResolved": false, "seeded": false, "saves": 0, "failures": 0, "notes": [] }
 }
 ```
 
-Angka nol di atas adalah keadaan awal yang sebenarnya. Semua penghitung
-diinisialisasi ke `0` di `lib/index.js:279` dan `listSeed` mulai sebagai
-`undefined` (`lib/index.js:469`), yang diterjemahkan ke `seedResolved: false`.
+`mode` bernilai `list-memo` saat plugin membungkus `list`, atau `inert` saat
+service host tidak punya method itu. Mode `inert` tetap memasang route supaya
+keadaan plugin tetap terlihat dari luar; itu jalan degradasi yang sudah teruji.
+
+Angka nol di atas adalah keadaan awal yang sebenarnya.
 
 Arti setiap field:
 
 | Field | Arti | Kapan naik |
 | --- | --- | --- |
-| `inspect.hits` | `inspect(id)` dilayani dari cache | Stat file tidak berubah dan sesi tidak sedang aktif |
-| `inspect.misses` | `inspect(id)` membaca ulang dari disk | Entri tidak ada, atau stat tidak cocok |
-| `inspect.stale` | Entri dibuang karena file benar-benar berubah | Revisi file beda. **Tidak** naik hanya karena sesi jadi aktif atau karena sesi dibuang, itu dihitung di `liveSkips` (`lib/index.js:404`) |
-| `inspect.liveSkips` | Sesi aktif ditolak untuk disimpan | Sesi sedang aktif, jadi event-nya berubah terus (`lib/index.js:432`) |
+| `mode` | Lapisan mana yang aktif | `list-memo` atau `inert` |
 | `list.hits` | `list()` dilayani dalam TTL | Umur memo kurang dari `listTtlMs` |
-| `list.misses` | Scan direktori nyata dijalankan | Dihitung di dalam memo (`lib/index.js:577`), jadi termasuk scan yang dijalankan untuk mencari path log, bukan cuma pemanggil `list()` |
-| `list.staleServed` | Dilayani dari jendela stale | Umur memo antara `listTtlMs` dan `listTtlMs + listMaxStaleMs` (`lib/index.js:626-630`) |
-| `cache.entries` | Jumlah entri yang tersimpan | Setelah `inspect` miss yang berhasil di-cache |
-| `cache.totalCost` | Total event terparse yang dibebankan | Jumlah `events.length` dari seluruh entri |
-| `cache.inflight` | Baca yang sedang digabung | Saat beberapa `inspect(id)` tanpa signal berjalan bersamaan |
-| `cache.coalesceLimit` | Batas ukuran map in-flight | Setelah batas ini baca baru tidak digabung lagi: tidak diantre, tidak dibuang, hanya dijalankan terpisah (`lib/index.js:329`) |
+| `list.misses` | Scan direktori nyata dijalankan | Termasuk scan yang dipicu refresh di belakang, bukan hanya pemanggil langsung |
+| `list.staleServed` | Dilayani dari jendela stale | Umur memo antara `listTtlMs` dan `listTtlMs + listMaxStaleMs` |
+| `lifecycle.disposedDrops` | Memo dibuang karena ada sesi dibuang | Event `session/disposed` datang saat memo hangat |
+| `lifecycle.purgeDrops` | Memo dibuang melalui endpoint purge | POST purge saat memo hangat |
+| `memo.warm` | Memo sedang berisi hasil scan | Setelah satu scan selesai |
+| `memo.ageMs` | Umur memo dalam ms | `null` saat memo kosong |
+| `memo.inflight` | Ada scan yang sedang berjalan | Selama satu scan berlangsung |
 | `snapshot.path` | Lokasi file snapshot, `null` bila dimatikan | Dihitung sekali saat mount |
 | `snapshot.seedResolved` | Seed boot sudah dicoba | Setelah satu pemanggilan `list()`, apa pun hasilnya |
 | `snapshot.seeded` | Memo sedang holds data dari snapshot | True sampai scan nyata berikutnya menggantikannya (`lib/index.js:537`, `729`) |
@@ -503,23 +513,23 @@ Perilaku yang perlu diketahui:
   `{ "error": "method not allowed; use POST" }` (`lib/index.js:738-743`).
 - Dengan `?id=`, entri itu dihapus dari cache dan dari daftar in-flight.
   `purged: 1` kalau ditemukan, `0` kalau tidak.
-- Tanpa `id`, semua entri dan semua in-flight dikosongkan, dan `purged` berisi
-  jumlah entri.
-- Pembersihan **tidak** menyentuh memo `list`, dan sengaja mempertahankan memo
-  path log yang sudah ketemu, sehingga baca berikutnya tetap melewati scan
-  direktori walau view-nya dibaca ulang.
-- Pembersihan menaikkan epoch invalidasi. Baca yang sedang berjalan saat itu tidak
-  akan memasang view-nya setelah selesai (`lib/index.js:735`, `268`). Menghapus
-  `id` yang tidak ada hanya melaporkan `purged: 0` tetapi tetap menaikkan epoch.
+- Tanpa `id`, memo `list` dikosongkan, dan `purged` bernilai `1` kalau memo
+  sedang hangat atau `0` kalau sudah kosong.
+- Pembersihan menaikkan epoch invalidasi. Scan yang sedang berjalan saat itu tidak
+  akan memasang hasilnya setelah selesai, sehingga purge tidak bisa dibatalkan
+  oleh baca yang sudah terlambat mulai.
+- Query `id` tidak lagi punya arti: tidak ada entri per-sesi sejak 2026-10-10,
+  jadi parameter itu diabaikan dan seluruh memo yang dibuang.
 
 ### 7.3 Bentuk normal setelah dipakai
 
-Setelah beberapa sesi dibuka dan ditutup ulang di GUI, bentuk yang wajar adalah
-`inspect.hits` naik, `inspect.misses` naik lebih lambat, `list.staleServed` naik
-sementara `list.hits` tetap dekat nol. Itu bukan tanda kegagalan: kalau satu scan
-`list()` memakan detik, memo dengan TTL 750 ms sudah basi sebelum pemanggil yang
-memicunya selesai. Bentuk itu justru yang sehat pada host seperti ini, dan
-dijelaskan di `lib/index.js:24-30`.
+Setelah beberapa daftar sesi dibuka berulang di GUI, bentuk yang wajar adalah
+`list.misses` naik satu per scan nyata, `list.hits` naik untuk panggilan yang
+datang dalam 750 ms setelah scan, dan `list.staleServed` naik sementara
+`list.hits` tetap dekat nol. Itu bukan tanda kegagalan: kalau satu scan `list()`
+memakan detik, memo dengan TTL 750 ms sudah basi sebelum pemanggil yang memicunya
+selesai. Bentuk itu justru yang sehat pada host seperti ini, dan dijelaskan di
+komentar `listMaxStaleMs` pada `lib/index.js`.
 
 ### 7.4 Angka yang tercatat di repo
 
@@ -558,15 +568,13 @@ dsh-session-readcache/
 ├── lib/
 │   └── index.js                     # SELURUH implementasi plugin
 ├── tests/
-│   ├── logic.mjs                    # 41 unit test terhadap service palsu
-│   ├── subagent-signal.mjs          # 8 test jalur AbortSignal
-│   └── realfile.mts                 # probe integrasi pada log sesi nyata
+│   ├── logic.mjs                    # 24 unit test kontrak memo list baru
+│   ├── runtime-smoke.mjs            # boot host terisolasi, bukti lewat batas host
+│   └── driver-plugin/               # bundle sekali-pakai untuk runtime-smoke (bukan untuk produksi)
 ├── docs/
 │   ├── HOST-TICKET-sessionListMetadata.md   # tiket ke owner host, lengkap dengan koreksi
 │   └── superpowers/plans/
 │       └── 2026-10-05-session-readcache-extensions.md  # rencana pengembangan A + C
-├── smoke-test.mjs                   # uji terhadap host yang sedang hidup di :13080
-├── measure-e2e.mjs                  # ukur dampak terhadap host yang sedang hidup
 ├── better-sqlite3/                  # salinan modul native, di-ignore git
 ├── artifacts/                       # hasil investigasi, reproduksi, laporan breaker/judge
 ├── .snapshots/                      # salinan baseline, di-ignore git
@@ -621,23 +629,20 @@ npm_config_devdir="$PWD/.npm-cache/node-gyp" npm install --cache ./.npm-cache
 node tests/logic.mjs
 ```
 
-```bash
-node tests/subagent-signal.mjs
-```
+Aturan uji terhadap host hidup (boot host terisolasi + driver di dalam host):
 
 ```bash
-tsx tests/realfile.mts
+node tests/runtime-smoke.mjs
 ```
 
-### 9.3 Uji terhadap host yang hidup
-
-```bash
-node smoke-test.mjs
-```
-
-```bash
-node measure-e2e.mjs
-```
+Perintah tersebut membangun DSH_HOME terisolasi di `tmpdir`, menyalin profil web
+yang sedang hidup, menambahkan satu bundle driver sekali-pakai
+(`artifacts/driver-plugin`, hanya untuk uji ini), lalu mem-boot host sungguhan
+dengan kode plugin terkini. Yang dibuktikan dari batas host: banner mount
+`mode=list-memo`, dua panggilan `sessionPersistence.list()` nyata dari dalam host,
+penghitung metrics `list.misses=1` dan `list.hits=1`, serta file snapshot yang
+benar-benar ada di disk. Kalau salah satu tidak terlihat, skrip keluar dengan kode
+1 (fail-closed).
 
 ### 9.4 Verifikasi modul native
 
@@ -679,11 +684,14 @@ dengan kode tertentu.
 
 Perhatikan bahwa `node --test tests/` (dengan garis miring, tanpa glob) **gagal
 resolve** di Node 24: `Cannot find module .../tests`, exit 1. Bentuk yang bekerja
-adalah glob: `node --test "tests/*.mjs"`. Terukur pada perubahan hardening
-2026-10-09: `tests 3, pass 2, fail 1` — yang gagal `tests/runtime-smoke.mjs`,
-karena berkas itu sekarang fail-closed dan di lingkungan ini host child mati lebih
-dulu (alasannya ada di bagian 10.6). `tests/logic.mjs` dan
-`tests/subagent-signal.mjs` lulus juga di bawah `node --test`.
+adalah glob: `node --test "tests/*.mjs"`.
+
+Terukur 2026-10-10 setelah adaptasi kontrak: `node tests/logic.mjs` → 24/24 pass
+exit 0; `node tests/runtime-smoke.mjs` → `STATUS: PROVEN` exit 0 pada host
+terisolasi (banner `mode=list-memo`, dua panggilan `list()` nyata,
+`list.misses=1`, `list.hits=1`, snapshot tersimpan di DSH_HOME terisolasi).
+`node --test` hanya menjalankan berkas pola test-nya, dan berkas repo ini punya
+loop masing-masing, jadi bentuk yang dipakai README ini adalah eksekusi langsung.
 
 ### 10.2 Cara keberhasilan dilaporkan
 
@@ -736,9 +744,10 @@ persistensi selalu memakai `snapshotPath` eksplisit di bawah `tmpdir()`.
 
 ### 10.4 Jenis test yang ada
 
-**`tests/logic.mjs`, 70 test.** Semua berjalan terhadap service palsu
-(`makeFake()` di baris 27) dengan file sementara di `tmpdir()` sungguhan, supaya
-validasi `stat` benar-benar jalan dan bukan mock. Kelompoknya:
+**`tests/logic.mjs`, 24 test.** Semua berjalan terhadap service palsu
+(`makeFake()` di baris 27) dengan direktori sementara di `tmpdir()` sungguhan.
+Kontrak service sekarang mengikuti host 0.2.0-rc.2: yang disediakan hanya
+`list()`, dan itu memang yang dibungkus plugin. Kelompoknya:
 
 | Kelompok | Contoh label | Yang diuji |
 | --- | --- | --- |
@@ -747,45 +756,31 @@ validasi `stat` benar-benar jalan dan bukan mock. Kelompoknya:
 | Snapshot | `snapshot: a persisted list seeds the memo at boot within its age` | Boot dijawab dari snapshot tanpa menunggu scan |
 | Snapshot | `snapshot: an expired snapshot is ignored and a real scan runs` | Snapshot-too-old ditolak |
 | Snapshot | `snapshot: path comes from the dshHomePath service when config omits it` | Resolusi path default |
-| Inspect | `inspect: miss then hit (original called once)` | Cache basics |
-| Inspect | `inspect: live sessions are never cached` | Sesi aktif tidak pernah di-cache |
-| Inspect | `inspect: LRU evicts oldest beyond maxEntries` | Eviction |
-| Inspect | `inspect: a write inside the read window never gets certified by a later stat` | Race antara append dan stat |
-| List | `list: TTL caches repeat calls; signal bypasses cache` | TTL dan jalur signal |
-| List | `list: past-TTL inside the stale window is served instantly and refreshes behind` | Jendela stale |
-| List | `list: listMaxStaleMs 0 keeps strict-TTL behaviour` | `0` berarti tidak ada stale window |
-| Purge | `purge: with id removes only that entry` | Endpoint purge |
-| Purge | `purge: a read parked on the cache-hit path cannot restore the purged entry` | Interaksi purge dan baca yang sedang menunggu stat |
-| Metrics | `metrics: counts inspect hits/misses and list hits/misses` | Bentuk JSON metrics |
-| Dispose | `dispose restores original methods` | Unmount mengembalikan method asli |
-| LRU | `inspect: a hit refreshes recency, so the oldest entry is the one evicted` | Hit memperbarui recency, eviction benar-benar LRU |
-| LRU | `inspect: resident events never exceed maxTotalEvents` | Anggaran event adalah batas keras |
-| LRU | `inspect: an attach race with signalled readers does not corrupt the cost accounting` | Satu biaya dikurangi tepat sekali (regresi buku biaya) |
-| Paralel | `inspect: concurrent reads of one id fold into one host read, distinct ids do not` | Hanya permintaan ekuivalen yang digabung |
-| Paralel | `inspect: the in-flight slot is released after success and after failure` | Slot in-flight bersih setelah resolve dan reject |
-| Parsial | `inspect: an empty view is not cached (a partial result is not a result)` | Hasil parsial tidak masuk cache |
-| Ekivalensi | `inspect: cache on and cache off return the same data` | Cache aktif identik secara fungsional dengan cache mati |
-| Lifecycle | `inspect: a session that was disposed is re-read from the host` | Sesi dibuang tidak dilayani dari cache |
-| Lifecycle | `inspect: a read parked on the stat when the dispose lands delegates to the host` | Baca yang tertahan di stat jatuh ke host |
-| Lifecycle | `inspect: a deleted log re-reads and the host error still surfaces` | File hilang: error host tetap muncul |
-| Lifecycle | `inspect: a recreated log (new inode, same size) invalidates the entry` | Identitas file bagian dari cache key |
-| TTL | `list: TTL boundary — just before expiry is a hit, at expiry is a scan` | Batas tepat TTL, jam palsu, tanpa sleep panjang |
-| TTL | `list: stale window boundary — inside it the last scan is served, past it the caller waits` | Batas tepat jendela stale |
-| TTL | `list: a backwards wall-clock step cannot extend the memo` | Langkah jam dinding tak memperpanjang memo |
-| Snapshot | `snapshot: a row written by an unknown schema version is refused` | Versi skema divalidasi |
-| Snapshot | `snapshot: a saved_at from the future is refused` | Cap masa depan korup ditolak |
-| Snapshot | `snapshot: an oversized row is refused without being materialised` | Batas ukuran baris |
-| Snapshot | `snapshot: a row holding a prototype-reaching key is refused` | Prototype pollution lewat snapshot ditolak |
-| Snapshot | `list: a served header copy cannot carry a prototype-reaching key` | Salinan header membuang key berbahaya |
-| Snapshot | `snapshot: a locked database is recorded and list() still answers` | DB terkunci: fallback + terobservasi |
-| Snapshot | `snapshot: an unwritable snapshot location is recorded and list() still answers` | Lokasi tak bisa ditulis: fallback + terobservasi |
-| Snapshot | `snapshot: repeated failed writes cannot grow the notes array without bound` | Array notes dibatasi |
-| Injeksi | `inspect: a session id carrying SQL metacharacters is only ever a value` | Id SQL-ish hanya pernah jadi nilai |
-| Konfig | `config: invalid values fall back to the documented defaults and say so` | Nilai tidak valid dilaporkan, bukan didiamkan |
-| Konfig | `config: boundary values are accepted and keep their meaning` | Nilai batas diterima |
-| Konfig | `config: enabled false disables the plugin; a non-boolean enabled does not` | Hanya `false` persis mematikan plugin |
-| Fallback | `cache: a bookkeeping failure never breaks the read` | Kegagalan cache tidak merusak baca |
-| Mount | `inspect: the plugin still wraps the service when no webServer exists` | Tanpa web surface plugin tetap aktif |
+| Kelompok | Contoh label | Yang diuji |
+| --- | --- | --- |
+| Mount | `mount: the plugin mounts and memoizes with a persistence that has no inspect` | Regresi kematian diam-diam pada host 0.2.0-rc.2: tanpa `inspect`, plugin tetap mount dan memo tetap bekerja |
+| Mount | `mount: a persistence without list() mounts inert but still exposes metrics` | Degradasi jujur: mode `inert`, route tetap terpasang, tidak ada lemparan |
+| Mount | `mount: disabled by config leaves no routes` | `enabled: false` benar-benar mematikan plugin |
+| List | `list: a second call inside the TTL is served from the memo` | Hit dalam TTL, satu scan untuk dua panggilan |
+| List | `list: past the TTL and past the stale window the memo is rescanned` | Scan ulang setelah kedua jendela habis |
+| List | `list: past the TTL but inside the stale window the caller is served immediately` | Balas segera + refresh di belakang |
+| List | `list: concurrent calls share one scan` | Penggabungan permintaan bersamaan |
+| List | `list: a signalled caller bypasses the memo and is counted as a miss` | Jalur signal tetap dihitung jujur |
+| List | `list: a pre-aborted caller is not counted (the host never scans)` | Pemanggil yang sudah dibatalkan tidak dihitung |
+| List | `list: the memo hands out copies; caller mutation cannot poison it` | Salinan di jalan keluar |
+| List | `list: prototype-reaching header keys are stripped on the way out` | Kunci `__proto__` dan sejenisnya dibuang |
+| Snapshot | `snapshot: a completed scan is persisted` | Baris snapshot benar-benar ditulis ke SQLite |
+| Snapshot | `snapshot: a young row seeds the first reply without scanning` | Boot seeding bekerja |
+| Snapshot | `snapshot: a row older than snapshotMaxAgeMs is not served` | Umur divalidasi |
+| Snapshot | `snapshot: a row stamped in the future is refused` | Stempel masa depan ditolak |
+| Snapshot | `snapshot: rows that are not session headers are refused, not served` | Bentuk baris divalidasi sebelum dipercaya |
+| Snapshot | `snapshot: a schema version mismatch refuses the row` | Versi skema divalidasi |
+| Snapshot | `snapshot: with no snapshotPath nothing is written and list still answers` | Tanpa lokasi: tidak menebak, tidak menulis |
+| Snapshot | `snapshot: a failed save is counted and noted, the caller still gets headers` | Kegagalan tulis terhitung, pemanggil tetap dilayani |
+| Lifecycle | `lifecycle: session/disposed drops the memo so the next list rescans` | Pembuangan sesi membuang memo |
+| Purge | `purge: the endpoint clears the memo` | Endpoint purge bekerja dan menghitung |
+| Config | `config: invalid values fall back to defaults and the route reports them` | Validasi konfigurasi |
+| Config | `config: explicit zero TTL with zero stale window rescans every call` | `0` berarti perilaku ketat, bukan error |
 
 **`tests/subagent-signal.mjs`, 8 test.** Semua tentang `AbortSignal`, yaitu objek
 yang dipakai host untuk meminta pembacaan dihentikan. Berkas ini adalah bukti
@@ -834,10 +829,11 @@ lewati bagian ini:
 
 - Semua pengukuran runtime dilakukan pada replika terisolasi, bukan pada proses GUI
   yang sedang berjalan (`SECURITY-AUDIT.md` bagian 7).
-- Dua jalur pemanggil `inspect(id, signal)` di
-  `packages/subagent/subagent/src/list-children.ts:382` dan `continuation.ts:954`
-  baru diuji lewat `tests/logic.mjs` dan `tests/subagent-signal.mjs`. Belum ada
-  bukti eksekusi end-to-end di jalur subagent (`SECURITY-AUDIT.md` bagian 4).
+- Belum ada bukti eksekusi end-to-end pada jalur subagent: driver di
+  `tests/runtime-smoke.mjs` memanggil `sessionPersistence.list()` langsung, bukan
+  lewat RPC `session.list` dari klien GUI (`SECURITY-AUDIT.md` bagian 4). RPC GUI
+  sendiri berjalan di atas WebSocket `connection`, bukan HTTP POST `/api`, jadi
+  pengukur HTTP lama (`smoke-test.mjs`, `measure-e2e.mjs`) sudah dihapus.
 - **Validasi store-level yang hanya bisa dilihat dengan scan direktori tetap tidak
   ditiru.** Cache hit memvalidasi berkas artifact-nya, bukan seluruh pojok store.
   Kalau store rusak dengan cara yang hanya terlihat lewat scan (id kembar di dua
@@ -944,21 +940,21 @@ Kalau `snapshot.path` bernilai `null`, persistentinya memang tidak diaktifkan.
 Baca bagian 5.3: plugin tidak menebak lokasi, jadi tanpa `snapshotPath`, tanpa
 service `dshHomePath`, dan tanpa `DSH_HOME`, tidak ada file yang ditulis.
 
-### 11.5 Cache `inspect` tidak pernah hit
+### 11.5 Memo `list` tidak pernah hit
 
-Gejala: `inspect.misses` naik terus, `inspect.hits` tetap `0`.
+Gejala: `list.misses` naik terus, `list.hits` tetap `0`.
 
-Empat penyebab yang bisa dijelaskan oleh kode:
+Tiga penyebab yang bisa dijelaskan oleh kode:
 
 | Penyebab | Kenapa | Cara memastikan |
 | --- | --- | --- |
-| Sesi sedang aktif | Sesi aktif ditolak untuk di-cache demi kebenaran (`lib/index.js:423-426`) | `inspect.liveSkips` naik |
-| Tidak ada path log yang bisa ditentukan | Cache butuh path file untuk melakukan stat sebelum baca (`lib/index.js:646-675`) | `target.locate()` tidak mengembalikan `path` untuk header itu |
-| View-nya tidak berasal dari file yang di-stats | Kalau header yang terdaftar dan `meta` yang kembali menunjuk artefak berbeda, tidak ada yang di-cache (`lib/index.js:439-440`) | Bandingkan keduanya |
-| Tolak ukuran | Kalau `events.length` melebihi `maxTotalEvents`, tidak ada yang di-cache (`lib/index.js:442`) | Naikkan `maxTotalEvents` |
+| Interval pemanggil lebih panjang dari TTL | Satu scan memakan detik, sedangkan TTL hanya 750 ms; memo basi sebelum pemanggil berikutnya datang | Gejala yang benar justru `list.staleServed` naik |
+| Ada purge atau dispose di antaranya | Purge dan `session/disposed` sengaja membuang memo | `lifecycle.purgeDrops` atau `lifecycle.disposedDrops` naik |
+| Mode `inert` | Service host tidak punya `list()`, jadi tidak ada yang dibungkus | `mode` di metrics bernilai `inert` |
 
-Perhatikan bahwa `inspect.stale` **tidak** naik karena sesi jadi aktif, itu dihitung
-di `liveSkips`.
+Kalau yang Anda cari adalah cache untuk membaca satu sesi (bukan daftar), itu
+sekarang milik host: `sessionQuery.observeSession` sudah punya cache sendiri yang
+di-key revisi `stat`.
 
 ### 11.6 `list.hits` selalu nol
 
@@ -1042,11 +1038,11 @@ Ada empat kontrak yang disebut berulang kali di `lib/index.js` dan di
 
 | Kontrak | Aturannya | Di mana dijaga |
 | --- | --- | --- |
-| Cache bersifat advisory | Setiap kegagalan di lapisan cache harus jatuh ke method asli | `lib/index.js:453-456`, `650-675` |
-| Hanya cold-only | Sesi yang sedang aktif tidak pernah di-cache, dan setiap jalur cache mengecek ulang sebelum mengembalikan | `lib/index.js:369-378`, `421-424` |
-| Set faithfully pada pembatalan | Pemanggil yang membawa signal tidak pernah digabung, dan signal diperiksa ulang setiap `await` | `lib/index.js:337-340`, `357`, `369` |
-| Bungkus hanya cold | Method tulis, `load`, `prepare`, dan perbaikan tidak dibungkus | Hanya `inspect` dan `list` yang di-`defineProperty` (`lib/index.js:674-676`) |
-| Invalidasi lifecycle | Sesi yang dibuang berhenti dilayani dari cache sebelum host selesai menulis event terakhirnya | `lib/index.js:679-694`, `367-376` |
+| Cache bersifat advisory | Setiap kegagalan di lapisan cache harus jatuh ke method asli | `try/catch` di sekeliling pemakaian memo dan penulisan snapshot |
+| Set faithfully pada pembatalan | Pemanggil yang membawa signal tidak pernah dilayani dari memo, dan tidak dihitung kalau sudah dibatalkan lebih dulu | `lib/index.js`, fungsi `list(signal)` |
+| Bungkus hanya baca | Method tulis, `load`, `prepare`, dan perbaikan tidak dibungkus | Hanya `list` yang di-`defineProperty`, dan hanya kalau method itu ada |
+| Invalidasi lifecycle | Sesi yang dibuang membuat daftar berikutnya memindai ulang | Listener `session/disposed` membuang memo dan menaikkan epoch |
+| Mount tidak boleh mati diam-diam | Kalau method yang akan dibungkus tidak ada, plugin tetap mount, tetap memasang route, dan melaporkan mode `inert` | `mode` di banner dan metrics |
 
 Kontrak kelima adalah tambahan dari hardening 2026-10-09. Sebelumnya entri cache
 satu sesi bisa bertahan melewati pembuangan sesi itu, dan karena pemanggil yang
@@ -1063,8 +1059,8 @@ dari struktur file dan catatan di dalam kode:
 
 1. **Baca dulu test.** Nama test di `tests/logic.mjs` sangat deskriptif dan
    menyatakan perilaku yang harus dipertahankan. Misalnya
-   `inspect: live sessions are never cached` adalah spesifikasi, bukan sekadar
-   pemeriksaan.
+   `mount: the plugin mounts and memoizes with a persistence that has no inspect`
+   adalah spesifikasi regresi, bukan sekadar pemeriksaan.
 2. **Ubah `lib/index.js`.** Hanya ada satu file implementasi.
 3. **Jalankan test unit lebih dulu**, karena paling cepat dan paling deterministik:
 
@@ -1282,12 +1278,12 @@ ABI Node. Alasannya tercatat di README lama repo ini.
 
 Karena plugin bersifat advisory. Boot tidak boleh gagal karena cache. Jalur
 snapshot di-`try`/`catch` di setiap titik, dan hasilnya dilaporkan di
-`snapshot.notes`. Konsekuensinya: kalau `better-sqlite3` hilang, plugin tetap
-mempercepat `inspect`, dan hanya boot seeding yang mati.
+`snapshot.notes`. Konsekuensinya: kalau `better-sqlite3` hilang, memo `list`
+tetap bekerja, dan hanya persistenansi snapshot yang mati.
 
 **Apakah plugin menulis ke log sesi?**
 
-Tidak. Ia hanya membungkus `inspect` dan `list`, dua method baca. Penulisan sesi,
+Tidak. Ia hanya membungkus `list`, satu method baca. Penulisan sesi,
 `load`, `prepare`, dan perbaikan data tidak pernah dibungkus. Ini disebut di
 README lama repo ini sebagai sifat non-committing.
 
@@ -1310,10 +1306,9 @@ file itu. Tabelnya dibatasi `CHECK (id = 1)` sehingga isinya tidak akan menumpuk
 
 Method asli diikat sekali saat mount, lalu hanya dipakai sebagai jalur tembolok.
 `dispose` menghapus properti wrapper dari objek target. Untuk backend yang
-mengimplement `inspect` dan `list` di prototipe kelas, method prototipe muncul
-kembali begitu properti wrapper dihapus. Backend yang menetapkan keduanya sebagai
-own property akan kehilangan keduanya setelah dihapus. Batasan ini tercatat di
-README lama repo ini.
+mengimplement `list` di prototipe kelas, method prototipe muncul kembali begitu
+properti wrapper dihapus. Backend yang menetapkannya sebagai own property akan
+kehilangannya setelah dihapus. Batasan ini tercatat di README lama repo ini.
 
 **Bisakah saya menjalankan test tanpa DSH host?**
 
@@ -1340,11 +1335,10 @@ Centang setiap langkah dari mendapat repo sampai memakai plugin.
 - [ ] 10. Konfigurasi di `cordis.patch.yml` sesuai kebutuhan, khususnya `listMaxStaleMs` bila kesegaran data lebih penting daripada kecepatan
 - [ ] 11. `snapshotPath` sudah ditentukan, atau sudah dipastikan host menyediakan service `dshHomePath` atau `DSH_HOME`
 - [ ] 12. Test unit hijau: `node tests/logic.mjs` dan `node tests/subagent-signal.mjs`
-- [ ] 13. Probe integrasi hijau: `tsx tests/realfile.mts`
-- [ ] 14. Uji host hidup hijau: `node smoke-test.mjs`
-- [ ] 15. Endpoint metrics menjawab: `curl http://127.0.0.1:13080/plugin/session-readcache/metrics`
-- [ ] 16. `snapshot.path` tidak bernilai `null`, dan `snapshot.notes` kosong
-- [ ] 17. Sudah memakai plugin: beberapa sesi dibuka dan dibuka ulang di GUI, lalu `inspect.hits` naik di metrics
+- [ ] 13. Uji host terisolasi hijau: `node tests/runtime-smoke.mjs` (output harus `STATUS: PROVEN`)
+- [ ] 14. Endpoint metrics menjawab di host hidup: `curl http://127.0.0.1:13080/plugin/session-readcache/metrics`
+- [ ] 15. `mode` di metrics bernilai `list-memo`, dan `snapshot.path` tidak `null`
+- [ ] 16. Sudah memakai plugin: beberapa daftar sesi dibuka berulang di GUI, lalu `list.hits` atau `list.staleServed` naik di metrics
 - [ ] 18. Rollback sudah diketahui: `dsh plugin --profile web remove dsh-session-readcache`
 
 ---
@@ -1361,10 +1355,9 @@ Bukan bagian untuk pembaca umum.
 | `package.json` | ditemukan | Nama, versi `0.1.0`, deskripsi, `type: module`, `main` dan `exports`, `files`, lisensi MIT, `engines.node >=20`, `dsh.engines.dsh >=0.1.1-rc.1`, `dsh.bundle.patch`, satu dependency. **Tidak ada blok `scripts`** |
 | `pnpm-lock.yaml` | ditemukan | `lockfileVersion 9.0`, `better-sqlite3@13.0.3` dengan `engines.node >=22`, `node-addon-api@8.9.2` |
 | `cordis.patch.yml` | ditemukan | 18 baris. Baris `insert` dengan `id: session-readcache`, `name: dsh-session-readcache`, lima kunci konfigurasi |
-| `lib/index.js` | ditemukan | 568 baris. `DEFAULTS`, validator, implementasi `inspect` dan `list`, pemuatan snapshot, dua route HTTP, blok dispose |
-| `tests/logic.mjs` | ditemukan | 784 baris, 41 pemanggilan `test(...)`, loop penutup |
-| `tests/subagent-signal.mjs` | ditemukan | 145 baris, 8 pemanggilan `test(...)` |
-| `tests/realfile.mts` | ditemukan | 86 baris, import decoder host, 5 assertion |
+| `lib/index.js` | ditemukan | `DEFAULTS`, validator konfigurasi, memo `list` dengan TTL/stale/coalescing, pemuatan snapshot SQLite, dua route HTTP, blok dispose |
+| `tests/logic.mjs` | ditemukan | Suite kontrak baru: 24 test, loop penutup sendiri, exit code fail-closed |
+| `tests/runtime-smoke.mjs` | ditemukan | Boot host terisolasi dengan bundle driver sekali-pakai, fail-closed |
 | `tests/runtime-smoke.mjs` | ditemukan | 121 baris. Menjalankan binary CLI host dengan flag `web --profile web --port 0 --no-open` |
 | `smoke-test.mjs` | ditemukan | 87 baris. `BASE_URL http://127.0.0.1:13080`, RPC `session.list` dan `session.create` |
 | `measure-e2e.mjs` | ditemukan | 58 baris. `BASE http://127.0.0.1:13080`, membaca metrics, memanggil `session.history` pada sampel enam id |
@@ -1479,7 +1472,8 @@ menulis ulang dari file. Perbedaan yang perlu Anda perhatikan:
 
 | Klaim README lama | Status terhadap file |
 | --- | --- |
-| "34 unit tests" | File sekarang punya 41 pemanggilan `test`. |
+| "34 unit tests" | Saat penulisan ulang: 41 pemanggilan `test`. Setelah adaptasi kontrak 2026-10-10: 24 test, kontrak baru mengikuti host 0.2.0-rc.2 (`list()` saja). |
+| README lama mengatakan plugin membungkus `inspect()` dan `list()` | Salah untuk host 0.2.0-rc.2: `inspect` sudah tidak ada di service, dan sejak 2026-10-10 plugin hanya membungkus `list()` |
 | "versi 12.4.1 dari `github:ZiuChen/better-sqlite3` yang terpin di `ea0d8c7...`" | `package.json` dan `pnpm-lock.yaml` sama-sama menyebut `13.0.3` dari registry. Salinan 12.4.1 ada di direktori `better-sqlite3/` yang di-ignore. |
 | "Node host-nya v24.19.0" | Tidak ada file di repo yang mengunci versi Node. Dinyatakan perlu dikonfirmasi. |
 | "`.npm-cache/` sudah masuk `.gitignore`" | Benar, `.gitignore:10`. |

@@ -1,0 +1,5 @@
+# Test-only driver: its own bundle patch inserts the cordis entry that loads it,
+# mirroring how every real bundle declares itself.
+- insert:
+    - id: readcache-driver
+      name: readcache-driver
