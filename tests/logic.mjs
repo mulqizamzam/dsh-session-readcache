@@ -23,18 +23,35 @@ function dbRow(snapshotPath) {
   }
 }
 
+function isSignalLike(value) {
+  return value !== null && typeof value === 'object' &&
+    typeof value.aborted === 'boolean' && typeof value.addEventListener === 'function'
+}
+
 function makeFake({ listDelayMs = 0, ids = ['s1', 's2', 's3', 's4'], withInspect = false } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'readcache-'))
-  const calls = { list: 0 }
+  const calls = { list: 0, options: [] }
   const live = new Set()
-  const headers = ids.map((id, i) => ({ id, cwd: '/p1', createdAt: 1 + i }))
+  // The host's real contract: list() resolves to SessionPersistenceSnapshot[]
+  // — `{header, revision, ...}` — never a flat header. Both in-tree callers
+  // read snapshot.header.id (session-query's listPersisted, ACP's
+  // sessionList). An earlier fake returned flat headers, which is why the
+  // suite passed while the live memo served zero hits.
+  const snapshots = ids.map((id, i) => ({
+    header: { id, cwd: '/p1', createdAt: 1 + i },
+    revision: `r-${id}`,
+    eventCount: i,
+  }))
   const service = {
     get listCalls() { return calls.list },
-    async list(signal) {
+    get optionsSeen() { return calls.options },
+    async list(options) {
       calls.list += 1
+      calls.options.push(options)
       if (listDelayMs) await new Promise((r) => setTimeout(r, listDelayMs))
+      const signal = isSignalLike(options) ? options : options?.signal
       if (signal?.aborted) throw new Error('aborted')
-      return headers.map((h) => ({ ...h }))
+      return snapshots.map((s) => ({ ...s, header: { ...s.header } }))
     },
   }
   if (withInspect) {
@@ -195,17 +212,39 @@ test('list: concurrent calls share one scan', async () => {
   assert.equal(b.length, c.length)
 })
 
-test('list: a signalled caller bypasses the memo and is counted as a miss', async () => {
+// The host's list() takes an OPTIONS BAG ({signal?}), not a signal. Reading
+// the first argument as if it were the signal made every real caller bypass
+// the memo: the live host recorded 15 misses, 0 hits.
+test('list: a caller passing {signal} — the real options contract — is served from the memo', async () => {
   const fake = makeFake()
   apply(fake.ctx, {})
   await fake.list()
   const ac = new AbortController()
-  await fake.list(ac.signal)
-  assert.equal(fake.service.listCalls, 2)
-  assert.equal(fake.metrics().list.misses, 2)
+  await fake.list({ signal: ac.signal })
+  assert.equal(fake.service.listCalls, 1, 'a live-signal caller must hit the memo, not rescan')
+  assert.equal(fake.metrics().list.hits, 1)
+  assert.equal(fake.metrics().list.misses, 1)
+})
+
+test('list: the caller options bag is forwarded untouched to the host scan', async () => {
+  const fake = makeFake()
+  apply(fake.ctx, {})
+  const options = { signal: new AbortController().signal }
+  await fake.list(options)
+  assert.equal(fake.service.optionsSeen[0], options, 'the host must receive the caller own bag')
 })
 
 test('list: a pre-aborted caller is not counted (the host never scans)', async () => {
+  const fake = makeFake()
+  apply(fake.ctx, {})
+  await fake.list()
+  const ac = new AbortController()
+  ac.abort()
+  await assert.rejects(() => fake.list({ signal: ac.signal }), /aborted/)
+  assert.equal(fake.metrics().list.misses, 1)
+})
+
+test('list: a pre-aborted caller passing the bare signal is still forwarded (old host shape)', async () => {
   const fake = makeFake()
   apply(fake.ctx, {})
   await fake.list()
@@ -219,30 +258,45 @@ test('list: the memo hands out copies; caller mutation cannot poison it', async 
   const fake = makeFake()
   apply(fake.ctx, {})
   const first = await fake.list()
-  first.push({ id: 'evil' })
-  first[0].id = 'mutated'
+  first.push({ header: { id: 'evil' } })
+  first[0].header.id = 'mutated'
   const second = await fake.list()
   assert.equal(fake.service.listCalls, 1)
   assert.equal(second.length, 4)
-  assert.equal(second[0].id, 's1')
+  assert.equal(second[0].header.id, 's1')
 })
 
-test('list: prototype-reaching header keys are stripped on the way out', async () => {
+test('list: prototype-reaching keys are stripped from the snapshot and its header', async () => {
   const fake = makeFake()
   const original = fake.service.list
-  fake.service.list = async (signal) => {
-    const rows = await original(signal)
+  fake.service.list = async (options) => {
+    const rows = await original(options)
     rows[0].__proto__ = { polluted: true }
+    rows[0].header.__proto__ = { headerPolluted: true }
     return rows
   }
   apply(fake.ctx, {})
   const rows = await fake.list()
   assert.equal(rows[0].polluted, undefined)
+  assert.equal(rows[0].headerPolluted, undefined)
+  assert.equal(rows[0].header.polluted, undefined)
 })
 
 // --- snapshot persistence ----------------------------------------------------
 
-test('snapshot: a completed scan is persisted', async () => {
+test('snapshot: a young row of session snapshots seeds the first reply without scanning', async () => {
+  const fake = makeFake()
+  const snapshotPath = join(fake.dir, 'snap.db')
+  plantSnapshot(snapshotPath, [{ header: { id: 'seeded', cwd: '/p1', createdAt: 1 }, revision: 'r-seeded' }])
+  apply(fake.ctx, { snapshotPath })
+  const rows = await fake.list()
+  assert.equal(fake.service.listCalls, 0, 'the seed must answer the first call')
+  assert.equal(rows.length, 1)
+  assert.equal(rows[0].header.id, 'seeded')
+  assert.equal(fake.metrics().snapshot.seeded, true)
+})
+
+test('snapshot: a completed scan persists real session snapshots, reloadable as a seed', async () => {
   const fake = makeFake()
   const snapshotPath = join(fake.dir, 'snap.db')
   apply(fake.ctx, { snapshotPath })
@@ -252,23 +306,29 @@ test('snapshot: a completed scan is persisted', async () => {
   assert.ok(row, 'a snapshot row must exist')
   assert.equal(JSON.parse(row.headers).length, 4)
   assert.equal(fake.metrics().snapshot.saves, 1)
+  // The persisted row must satisfy the soundness check on the way back in:
+  // this is the exact row the live host wrote and the old check refused.
+  assert.equal(JSON.parse(row.headers)[0].header.id, 's1')
 })
 
-test('snapshot: a young row seeds the first reply without scanning', async () => {
+test('snapshot: a row of flat headers is refused, not served (the live seeding failure)', async () => {
   const fake = makeFake()
   const snapshotPath = join(fake.dir, 'snap.db')
+  // The shape the OLD checker accepted and the host never returns: a flat
+  // header with a top-level id. A row like this must not seed a memo, because
+  // callers read snapshot.header.id off every element.
   plantSnapshot(snapshotPath, [{ id: 'seeded', cwd: '/p1', createdAt: 1 }])
   apply(fake.ctx, { snapshotPath })
   const rows = await fake.list()
-  assert.equal(fake.service.listCalls, 0, 'the seed must answer the first call')
-  assert.equal(rows.length, 1)
-  assert.equal(fake.metrics().snapshot.seeded, true)
+  assert.equal(fake.service.listCalls, 1, 'a flat-header row must force a real scan')
+  assert.equal(fake.metrics().snapshot.seeded, false)
+  assert.match(JSON.stringify(fake.metrics().snapshot.notes), /not a list of session snapshots/)
 })
 
 test('snapshot: a row older than snapshotMaxAgeMs is not served', async () => {
   const fake = makeFake()
   const snapshotPath = join(fake.dir, 'snap.db')
-  plantSnapshot(snapshotPath, [{ id: 'old', cwd: '/p1', createdAt: 1 }], Date.now() - 7_000_000)
+  plantSnapshot(snapshotPath, [{ header: { id: 'old', cwd: '/p1', createdAt: 1 }, revision: 'r' }], Date.now() - 7_000_000)
   apply(fake.ctx, { snapshotPath })
   await fake.list()
   assert.equal(fake.service.listCalls, 1)
@@ -278,27 +338,27 @@ test('snapshot: a row older than snapshotMaxAgeMs is not served', async () => {
 test('snapshot: a row stamped in the future is refused', async () => {
   const fake = makeFake()
   const snapshotPath = join(fake.dir, 'snap.db')
-  plantSnapshot(snapshotPath, [{ id: 'future', cwd: '/p1', createdAt: 1 }], Date.now() + 7_000_000)
+  plantSnapshot(snapshotPath, [{ header: { id: 'future', cwd: '/p1', createdAt: 1 }, revision: 'r' }], Date.now() + 7_000_000)
   apply(fake.ctx, { snapshotPath })
   await fake.list()
   assert.equal(fake.service.listCalls, 1)
   assert.equal(fake.metrics().snapshot.seeded, false)
 })
 
-test('snapshot: rows that are not session headers are refused, not served', async () => {
+test('snapshot: rows that are not session snapshots are refused, not served', async () => {
   const fake = makeFake()
   const snapshotPath = join(fake.dir, 'snap.db')
-  plantSnapshot(snapshotPath, [{ id: 'ok', cwd: '/p1', createdAt: 1 }, 42])
+  plantSnapshot(snapshotPath, [{ header: { id: 'ok', cwd: '/p1', createdAt: 1 }, revision: 'r' }, 42])
   apply(fake.ctx, { snapshotPath })
   await fake.list()
   assert.equal(fake.service.listCalls, 1)
-  assert.match(JSON.stringify(fake.metrics().snapshot.notes), /not session headers/)
+  assert.match(JSON.stringify(fake.metrics().snapshot.notes), /not a list of session snapshots/)
 })
 
 test('snapshot: a schema version mismatch refuses the row', async () => {
   const fake = makeFake()
   const snapshotPath = join(fake.dir, 'snap.db')
-  plantRawSnapshot(snapshotPath, { headers: [{ id: 'x', cwd: '/p1', createdAt: 1 }], userVersion: 999 })
+  plantRawSnapshot(snapshotPath, { headers: [{ header: { id: 'x', cwd: '/p1', createdAt: 1 }, revision: 'r' }], userVersion: 999 })
   apply(fake.ctx, { snapshotPath })
   await fake.list()
   assert.equal(fake.service.listCalls, 1)

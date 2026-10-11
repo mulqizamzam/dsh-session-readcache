@@ -293,10 +293,19 @@ dipakai; nilai lain yang tidak dikenal membuat baris ditolak, bukan di-parse.
 Tidak ada migrasi: file lama dibiarkan, ditimpa oleh scan berikutnya.
 
 Isi `headers` divalidasi bentuknya sebelum dipercaya: harus array, setiap elemen
-harus objek dengan `id` string, dan tidak boleh punya key `__proto__`,
-`constructor`, atau `prototype` (penjaga prototype pollution, lihat
-`lib/index.js:150-160`). `copy()` juga membangun ulang setiap header key demi key
-sehingga key berbahaya tidak pernah ikut ke objek pemanggil (`lib/index.js:547-559`).
+harus **snapshot sesi** — objek dengan `header` objek yang `header.id`-nya string,
+yaitu bentuk yang benar-benar dikembalikan `SessionPersistence.list()`
+(`Promise<readonly SessionPersistenceSnapshot[]>`; kedua pemanggil in-tree,
+`session-query` `listPersisted` dan ACP `sessionList`, membaca
+`snapshot.header.id`). Sebelum patch 2026-10-11 pemeriksaannya meminta `id`
+ string di tingkat TERATAS, jadi setiap baris asli ditolak dan boot seeding
+tidak pernah menyajikan apa pun — gejala live: `snapshot headers are not
+session headers; rescanning` dengan `saves=1, failures=1`, dan memo yang tidak
+pernah seed. Elemen juga tidak boleh punya key `__proto__`, `constructor`, atau
+`prototype` — diperiksa di snapshot DAN di dalam `header`-nya (penjaga
+prototype pollution, `lib/index.js`). `copy()` membangun ulang setiap snapshot
+key demi key, dan `header`-nya juga, sehingga key berbahaya tidak pernah ikut
+ke objek pemanggil.
 
 ### 5.2 Penulisan
 
@@ -765,7 +774,8 @@ Kontrak service sekarang mengikuti host 0.2.0-rc.2: yang disediakan hanya
 | List | `list: past the TTL and past the stale window the memo is rescanned` | Scan ulang setelah kedua jendela habis |
 | List | `list: past the TTL but inside the stale window the caller is served immediately` | Balas segera + refresh di belakang |
 | List | `list: concurrent calls share one scan` | Penggabungan permintaan bersamaan |
-| List | `list: a signalled caller bypasses the memo and is counted as a miss` | Jalur signal tetap dihitung jujur |
+| List | `list: a caller passing {signal} — the real options contract — is served from the memo` | Pemanggil berbawa `{signal}` (kontrak asli host) DILAYANI dari memo; regresi live 15 miss/0 hit |
+| List | `list: the caller options bag is forwarded untouched to the host scan` | Argumen pemanggil diteruskan apa adanya ke host |
 | List | `list: a pre-aborted caller is not counted (the host never scans)` | Pemanggil yang sudah dibatalkan tidak dihitung |
 | List | `list: the memo hands out copies; caller mutation cannot poison it` | Salinan di jalan keluar |
 | List | `list: prototype-reaching header keys are stripped on the way out` | Kunci `__proto__` dan sejenisnya dibuang |
@@ -930,7 +940,7 @@ Baca `snapshot.notes` lebih dulu, karena alasannya selalu ditulis di sana:
 
 | Isi `snapshot.notes` | Penyebab | Perbaikan |
 | --- | --- | --- |
-| `snapshot headers are not session headers; rescanning` | Baris snapshot berisi yang bukan objek header sesi (`lib/index.js:510-514`) | Hapus file snapshot, lalu biarkan scan nyata menulis ulang |
+| `snapshot row is not a list of session snapshots; rescanning` | Baris snapshot berisi elemen yang bukan snapshot sesi (bukan objek, tanpa `header`, atau `header.id` bukan string) (`lib/index.js`) | Hapus file snapshot, lalu biarkan scan nyata menulis ulang. Kalau baris itu ditulis host sungguhan, laporkan: bentuk keluarannya berubah |
 | `snapshot too old (Xs); rescanning` | `saved_at` lebih tua dari `snapshotMaxAgeMs` (`lib/index.js:530-532`) | Normal. Turunkan `snapshotMaxAgeMs` hanya bila memang ingin menerima data lebih tua |
 | `snapshot load failed: <pesan>` | Database gagal dibuka atau dibaca (`lib/index.js:502`) | Periksa hak tulis direktori dan keutuhan file |
 | `snapshot save failed: unmounted before the snapshot write landed` | Mount sudah dilepas sebelum tulis landing (`lib/index.js:233`) | Normal pada reload. Bukan kegagalan |
@@ -1039,7 +1049,7 @@ Ada empat kontrak yang disebut berulang kali di `lib/index.js` dan di
 | Kontrak | Aturannya | Di mana dijaga |
 | --- | --- | --- |
 | Cache bersifat advisory | Setiap kegagalan di lapisan cache harus jatuh ke method asli | `try/catch` di sekeliling pemakaian memo dan penulisan snapshot |
-| Set faithfully pada pembatalan | Pemanggil yang membawa signal tidak pernah dilayani dari memo, dan tidak dihitung kalau sudah dibatalkan lebih dulu | `lib/index.js`, fungsi `list(signal)` |
+| Set faithfully pada pembatalan | Pemanggil yang SUDAH dibatalkan tidak pernah dilayani dari memo dan tidak dihitung (host tidak memindai apa pun); pemanggil yang membawa signal HIDUP dilayani dari memo, karena membatalkan scan tidak membuat balasan dari memori jadi basi. Argumen pertama host adalah OPTIONS BAG `{signal?}`, bukan signal-nya sendiri (`SessionPersistenceListOptions`) | `lib/index.js`, fungsi `list(options)` + `isAbortSignalLike` |
 | Bungkus hanya baca | Method tulis, `load`, `prepare`, dan perbaikan tidak dibungkus | Hanya `list` yang di-`defineProperty`, dan hanya kalau method itu ada |
 | Invalidasi lifecycle | Sesi yang dibuang membuat daftar berikutnya memindai ulang | Listener `session/disposed` membuang memo dan menaikkan epoch |
 | Mount tidak boleh mati diam-diam | Kalau method yang akan dibungkus tidak ada, plugin tetap mount, tetap memasang route, dan melaporkan mode `inert` | `mode` di banner dan metrics |
