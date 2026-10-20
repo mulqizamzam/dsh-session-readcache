@@ -91,7 +91,7 @@ Kesegaran adalah trade-off yang disengaja, jadi batasnya ditulis eksplisit:
 | Keadaan | Umur paling tua yang masih dilayani |
 | --- | --- |
 | Setelah scan nyata terakhir | `listMaxStaleMs` (30 detik dengan default) |
-| Setelah seed dari snapshot saat boot | `snapshotMaxAgeMs + listTtlMs + listMaxStaleMs` (10 menit + 750 ms + 30 detik dengan default) |
+| Setelah seed dari snapshot saat boot | `snapshotMaxAgeMs + listTtlMs + listMaxStaleMs` (10 menit + 750 ms + 30 detik dengan default). Terukur: seed ditolak saat restart karena snapshot berumur 56 menit |
 | Setelah `session/disposed` | `listMaxStaleMs`, untuk baris sesi yang dibuang tapi belum pernah ditulis ke disk |
 
 `session/disposed` tidak lagi membuang memo. Baris sesi yang dibuang masih bisa
@@ -177,6 +177,13 @@ terakhir bukan perintah yang bisa dijalankan dari repo yang dikloning.
    membuang barisnya. Batas yang lebih rapat bisa diambil dengan
    `target.stat(id)` milik host, tapi menambah ketergantungan API host baru di
    jalur event.
+5. **Jendela seed boot.** `snapshotMaxAgeMs` bawaan 10 menit lebih sempit dari
+   jeda \"idle lalu restart\" yang paling sering terjadi. Terukur di host hidup:
+   saat restart, snapshot terakhir berumur 56 menit, seed ditolak
+   (`snapshot too old (3357s); rescanning`), dan reply pertama membayar scan
+   penuh. Dua jalan menutupnya: naikkan jendela ke 24 jam (satu baris config,
+   tanpa I/O baru), atau tulis ulang snapshot secara berkala (kode baru plus
+   penulisan 4,7 MB per siklus).
 
 ## 13. Prinsip yang tidak boleh dilanggar
 

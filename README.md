@@ -220,7 +220,7 @@ Semua kunci opsional. Nilai di bawah adalah default yang tertera di
 | `maxTotalEvents` | `250000` | **Inert sejak 2026-10-10** (dulu anggaran event cache); tetap divalidasi dan dilaporkan | tidak, lihat `lib/index.js:53-60` |
 | `listTtlMs` | `750` | Selama jendela ini hasil scan `list()` dianggap segar dan dilayani sebagai hit | ya, `0` membuat memo selalu basi (`lib/index.js:53-60`) |
 | `listMaxStaleMs` | `30000` | Setelah TTL habis tapi masih di dalam jendela ini, hasil scan terakhir dikembalikan sambil refresh berjalan di belakang | ya, `0` mempertahankan perilaku TTL ketat (`lib/index.js:53-60`) |
-| `snapshotMaxAgeMs` | `600000` | Umur maksimum snapshot yang boleh mengisi memo saat boot | ya, `0` mematikan boot seeding (`lib/index.js:53-60`) |
+| `snapshotMaxAgeMs` | `600000` | Umur maksimum snapshot yang boleh mengisi memo saat boot. Terukur 2026-10-21: 10 menit terlalu sempit untuk jeda "idle lalu restart", jadi seed ditolak saat restart (bagian 7.4) | ya, `0` mematikan boot seeding (`lib/index.js:53-60`) |
 | `snapshotPath` | diturunkan | Lokasi file snapshot SQLite secara eksplisit | string kosong berarti pakai turunan (`lib/index.js:356-357`) |
 
 Contoh bentuk konfigurasi, diambil dari `cordis.patch.yml`:
@@ -582,12 +582,23 @@ Diukur ulang di host ini: korpus 4.016 log, 2,3 GB, `DSH_HOME` =
 | Scan yang dibuang oleh `session/disposed` | 1, tidak diulang | `artifacts/perf/verify-dispose-convergence.mjs` |
 | Serialisasi snapshot 4.016 header | 2,9 - 4,0 ms, sebelumnya di jalur respons pemanggil | `artifacts/perf/probe-snapshot-response-path.mjs` |
 | Metrik host hidup sebelum fix terpasang | `hits:0, misses:16, staleServed:5, disposedDrops:8, memo.warm:false` | `curl http://127.0.0.1:13080/plugin/session-readcache/metrics` |
-| Metrik host hidup setelah fix terpasang | `hits:0, misses:11, staleServed:1, disposedInvalidations:6, memo.warm:true` (umur memo 111 detik saat dibaca) | idem |
+| Metrik host hidup setelah fix terpasang | `hits:0, misses:4, staleServed:1, disposedInvalidations:3, memo.warm:true` | idem |
+| Seed boot setelah restart | Ditolak: `snapshot too old (3357s); rescanning` | idem |
 
 Baris sebelum fix dibaca dari host yang menjalankan build lama. Baris sesudah fix
-dibaca setelah host dimuat ulang dengan build baru. Perbedaannya yang terlihat:
-`memo.warm` tetap `true` walaupun enam `session/disposed` sudah datang, karena
-memo tidak lagi dibuang. Angka di tabel ini diukur pada satu host dan satu waktu;
+dibaca setelah host dimuat ulang dengan build baru. Yang terlihat dari baris
+sesudah: kunci metrik ikut berubah ke `disposedInvalidations`, dan memo tetap
+hangat melewati tiga `session/disposed`. Kebetulan "tetap hangat" itu sendiri
+belum membuktikan dispose tidak membuang memo, karena scan setelah dispose juga
+memanaskan memo lagi; yang membuktikannya ada di test `lifecycle: a disposed
+session must not make the next list() wait for a scan` dan di skrip
+`artifacts/perf/repro-dispose-stall.mjs`.
+
+Baris seed boot menunjukkan celah nyata: `snapshotMaxAgeMs` bawaan 10 menit,
+tapi snapshot terakhir berumur 56 menit saat host dimuat ulang, jadi seed
+ditolak dan reply pertama membayar scan penuh. Isi snapshot adalah daftar sesi,
+perubahannya lambat, jadi jendela 10 menit itu lebih sempit dari jeda
+"idle lalu restart" yang paling sering terjadi. Angka di tabel ini diukur pada satu host dan satu waktu;
 perlakukan sebagai catatan pengukuran, bukan jaminan.
 
 ---
