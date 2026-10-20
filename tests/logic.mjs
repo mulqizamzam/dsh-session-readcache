@@ -392,18 +392,54 @@ test('snapshot: a failed save is counted and noted, the caller still gets header
   assert.match(JSON.stringify(fake.metrics().snapshot.notes), /save failed/)
 })
 
+test('snapshot: the serialization runs after the caller already has its reply', async () => {
+  // The snapshot is a side effect: the list the caller asked for must not wait
+  // for the whole list to be serialized for the disk. README 5.2 says the row
+  // is written "outside the caller's response path" — this pins that.
+  const fake = makeFake()
+  const snapshotPath = join(fake.dir, 'snap.db')
+  const events = []
+  const realStringify = JSON.stringify
+  JSON.stringify = function patched(value, ...rest) {
+    if (Array.isArray(value) && value.length === 4 && value[0]?.header?.id === 's1') events.push('stringify')
+    return realStringify.call(JSON, value, ...rest)
+  }
+  try {
+    apply(fake.ctx, { snapshotPath })
+    await fake.list()
+    events.push('caller-resumed')
+    await new Promise((r) => setTimeout(r, 50))
+  } finally {
+    JSON.stringify = realStringify
+  }
+  assert.deepEqual(events, ['caller-resumed', 'stringify'])
+  assert.equal(fake.metrics().snapshot.saves, 1)
+})
+
 // --- lifecycle and purge ------------------------------------------------------
 
-test('lifecycle: session/disposed drops the memo so the next list rescans', async () => {
-  const fake = makeFake()
+test('lifecycle: a disposed session must not make the next list() wait for a scan', async () => {
+  // A dispose is a ONE-ROW event. The list it invalidates is a WHOLE-LIST
+  // memo, and refilling it runs the host's directory scan again: measured at
+  // 2.6 s warm and 77.7 s cold over this host's 4,016-log corpus. The host's
+  // own list() is disk-based, so a detached session that was materialized is
+  // still listed by the host — the rescan reproduced the memo's own contents.
+  // The next caller must therefore be answered from memory.
+  const fake = makeFake({ listDelayMs: 300 })
   const listeners = new Map()
   fake.ctx.on = (event, cb) => { const l = listeners.get(event) ?? []; l.push(cb); listeners.set(event, l) }
   apply(fake.ctx, {})
   await fake.list()
+  assert.equal(fake.metrics().memo.warm, true)
   for (const cb of listeners.get('session/disposed') ?? []) cb({ id: 's2' })
-  await fake.list()
-  assert.equal(fake.service.listCalls, 2)
-  assert.equal(fake.metrics().lifecycle.disposedDrops, 1)
+  const started = Date.now()
+  const rows = await fake.list()
+  const elapsed = Date.now() - started
+  assert.equal(rows.length, 4)
+  assert.ok(elapsed < 150, `the next list() waited ${elapsed} ms for a scan after a dispose`)
+  // The memo is invalidated, not thrown away: the refresh reconciles it.
+  assert.equal(fake.metrics().memo.warm, true)
+  assert.equal(fake.metrics().lifecycle.disposedInvalidations, 1)
 })
 
 test('purge: the endpoint clears the memo', async () => {

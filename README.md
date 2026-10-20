@@ -49,7 +49,7 @@ Istilah yang perlu diketahui sebelum lanjut:
 | --- | --- |
 | **Scan direktori** | `list()` membaca seluruh direktori sesi dan mengurai header tiap sesi. Pada host ini scan itu berlangsung detik-detik (3,8 ribu log terukur ~9,7 detik), dan itulah yang di-cache plugin. |
 | **LRU (least-recently-used)** | Algoritma eviction: elemen yang paling lama tidak diakses akan dibuang lebih dulu ketika cache penuh. |
-| **stat / revisi file** | Pembacaan metadata file (ukuran, waktu modifikasi, inode). Plugin memakai `stat` sebelum membaca file, sehingga data yang sudah dibaca bisa dicocokkan dengan kondisi file saat ini. |
+| **stat / revisi file** | Pembacaan metadata file (ukuran, waktu modifikasi, inode). Plugin memakai `stat` sebelum membaca file, sehingga data yang sudah dibaca bisa dicocokkan dengan kondisi file saat ini. **Mekanisme ini milik cache `inspect` per sesi yang sudah dihapus** (host `0.2.0-rc.2`); jalur `list()` yang dibungkus plugin ini tidak melakukan `stat` — `stat` per log dilakukan host di dalam `list()`-nya sendiri. |
 | **TTL (time to live)** | Lama waktu sebuah hasil cache dianggap masih segar sebelum harus dihitung ulang. |
 | **Stale window** | Jendela waktu tambahan setelah TTL habis, ketika hasil lama tetap dikembalikan sementara perhitungan baru berjalan di belakang. |
 | **Memo** | Satu nilai yang disimpan sementara supaya perhitungan mahal tidak dilakukan berulang kali dalam waktu dekat. |
@@ -63,9 +63,11 @@ Yang ditambahkan plugin, semuanya dari `lib/index.js`:
   sedang berjalan. Sumber nilai default: `lib/index.js:20-34`.
 - Jendela stale untuk `list`, supaya pemanggil tidak menunggu scan yang memakan
   detik-detik.
-- Invalidasi saat **sesi dibuang** (`session/disposed`): memo dibuang, sehingga
-  daftar berikutnya memindai ulang dan tidak pernah mengembalikan baris untuk sesi
-  yang sudah tidak ada di store.
+- Invalidasi saat **sesi dibuang** (`session/disposed`): memo ditandai basi, bukan
+  dibuang. Pemanggil berikutnya dilayani dari memori dalam hitungan milidetik dan
+  penyegaran berjalan di belakangnya, sehingga satu peristiwa satu baris tidak lagi
+  memaksa pemindai ulang direktori penuh. Batas basi yang berlaku sama dengan
+  jendela stale yang sudah dipakai plugin ini.
 - Snapshot SQLite dari scan terakhir, supaya restart tidak membayar scan penuh
   untuk reply pertamanya.
 - Dua endpoint HTTP pada web server host untuk melihat penghitung (_metrics_) dan
@@ -310,8 +312,10 @@ ke objek pemanggil.
 ### 5.2 Penulisan
 
 Tidak ada perintah migrasi, seed, atau init. Baris ditulis sendiri oleh plugin,
-setelah scan `list()` selesai, di luar jalur respons pemanggil
-(`lib/index.js:568-578`). Penulisan memakai satu pernyataan berparameter
+setelah scan `list()` selesai, di luar jalur respons pemanggil: serialisasi
+seluruh daftar (O(jumlah sesi), terukur 4,0 ms untuk 4.016 snapshot) dijadwalkan
+pada satu putaran macrotask, sehingga reply yang menutup scan sampai ke pemanggil
+lebih dulu (`lib/index.js:568-578`). Penulisan memakai satu pernyataan berparameter
 (`?`), jadi penulisan ulang satu baris bersifat atomik dan tidak membutuhkan
 tulis-tempel-lalu-rename seperti pada file JSON biasa. Tidak ada satu pun SQL di
 repo ini yang dirakit dari string masukan: id sesi hanya pernah menjadi nilai
@@ -464,7 +468,7 @@ Bentuk responsnya diambil dari handler di `lib/index.js`:
 {
   "mode": "list-memo",
   "list": { "hits": 0, "misses": 0, "staleServed": 0 },
-  "lifecycle": { "disposedDrops": 0, "purgeDrops": 0 },
+  "lifecycle": { "disposedInvalidations": 0, "purgeDrops": 0 },
   "memo": { "warm": false, "ageMs": null, "inflight": false },
   "config": { "maxEntries": 24, "listTtlMs": 750, "listMaxStaleMs": 30000, "snapshotMaxAgeMs": 600000, "maxTotalEvents": 250000 },
   "snapshot": { "path": null, "seedResolved": false, "seeded": false, "saves": 0, "failures": 0, "notes": [] }
@@ -485,7 +489,7 @@ Arti setiap field:
 | `list.hits` | `list()` dilayani dalam TTL | Umur memo kurang dari `listTtlMs` |
 | `list.misses` | Scan direktori nyata dijalankan | Termasuk scan yang dipicu refresh di belakang, bukan hanya pemanggil langsung |
 | `list.staleServed` | Dilayani dari jendela stale | Umur memo antara `listTtlMs` dan `listTtlMs + listMaxStaleMs` |
-| `lifecycle.disposedDrops` | Memo dibuang karena ada sesi dibuang | Event `session/disposed` datang saat memo hangat |
+| `lifecycle.disposedInvalidations` | Memo ditandai basi karena ada sesi dibuang | Event `session/disposed` datang saat memo hangat. Nama field sebelumnya `disposedDrops`: memo tidak lagi dibuang, hanya ditandai basi |
 | `lifecycle.purgeDrops` | Memo dibuang melalui endpoint purge | POST purge saat memo hangat |
 | `memo.warm` | Memo sedang berisi hasil scan | Setelah satu scan selesai |
 | `memo.ageMs` | Umur memo dalam ms | `null` saat memo kosong |
@@ -959,7 +963,7 @@ Tiga penyebab yang bisa dijelaskan oleh kode:
 | Penyebab | Kenapa | Cara memastikan |
 | --- | --- | --- |
 | Interval pemanggil lebih panjang dari TTL | Satu scan memakan detik, sedangkan TTL hanya 750 ms; memo basi sebelum pemanggil berikutnya datang | Gejala yang benar justru `list.staleServed` naik |
-| Ada purge atau dispose di antaranya | Purge dan `session/disposed` sengaja membuang memo | `lifecycle.purgeDrops` atau `lifecycle.disposedDrops` naik |
+| Ada purge di antaranya | Purge sengaja membuang memo; `session/disposed` tidak lagi membuang memo, hanya menandainya basi | `lifecycle.purgeDrops` naik |
 | Mode `inert` | Service host tidak punya `list()`, jadi tidak ada yang dibungkus | `mode` di metrics bernilai `inert` |
 
 Kalau yang Anda cari adalah cache untuk membaca satu sesi (bukan daftar), itu
@@ -1051,7 +1055,7 @@ Ada empat kontrak yang disebut berulang kali di `lib/index.js` dan di
 | Cache bersifat advisory | Setiap kegagalan di lapisan cache harus jatuh ke method asli | `try/catch` di sekeliling pemakaian memo dan penulisan snapshot |
 | Set faithfully pada pembatalan | Pemanggil yang SUDAH dibatalkan tidak pernah dilayani dari memo dan tidak dihitung (host tidak memindai apa pun); pemanggil yang membawa signal HIDUP dilayani dari memo, karena membatalkan scan tidak membuat balasan dari memori jadi basi. Argumen pertama host adalah OPTIONS BAG `{signal?}`, bukan signal-nya sendiri (`SessionPersistenceListOptions`) | `lib/index.js`, fungsi `list(options)` + `isAbortSignalLike` |
 | Bungkus hanya baca | Method tulis, `load`, `prepare`, dan perbaikan tidak dibungkus | Hanya `list` yang di-`defineProperty`, dan hanya kalau method itu ada |
-| Invalidasi lifecycle | Sesi yang dibuang membuat daftar berikutnya memindai ulang | Listener `session/disposed` membuang memo dan menaikkan epoch |
+| Invalidasi lifecycle | Sesi yang dibuang membuat memo basi, bukan membuahkannya: pemanggil berikutnya dilayani dari memori dan penyegaran berjalan di belakang | Listener `session/disposed` menandai memo basi (`listDirty`) di `lib/index.js` |
 | Mount tidak boleh mati diam-diam | Kalau method yang akan dibungkus tidak ada, plugin tetap mount, tetap memasang route, dan melaporkan mode `inert` | `mode` di banner dan metrics |
 
 Kontrak kelima adalah tambahan dari hardening 2026-10-09. Sebelumnya entri cache
@@ -1061,6 +1065,22 @@ dari store) sementara flush terakhir belum mendarat, jalur hit pernah
 mengembalikan view yang host sendiri tolak. Bukti sebelum/sesudah terhadap stack
 host nyata: `artifacts/h03-before-dispose-fix.out` (11/12 stale) dan
 `artifacts/h03-after-dispose-fix.out` (0/12).
+
+Balapan itu ada di jalur `inspect()` per sesi. Host `0.2.0-rc.2` menghapus
+`inspect` dari service, jadi jalur itu sudah tidak ada di plugin ini — dan jalur
+`list()` tidak bisa menghasilkan balapan yang sama: `list()` hanya mengembalikan
+header sesi, dan header (`id`, `createdAt`, `cwd`, `version`, `isSeeded`) tidak
+berubah saat flush terakhir mendarat. Yang bisa berubah hanyalah KEBERADAAN
+baris itu, dan hanya kalau sesinya belum pernah ditulis ke disk.
+
+Karena itu invalidasi lifecycle sekarang proporsional: `session/disposed`
+menandai memo basi, memo dilayani dari memori, dan penyegaran berjalan di
+belakang. Yang berubah: baris sesi yang dibuang tapi belum pernah ditulis ke
+disk masih bisa muncul sampai penyegaran selesai — batasnya sama dengan jendela
+stale yang sudah dipakai plugin ini, bukan scan penuh 2,6 detik (77,7 detik saat
+page cache host kosong) yang harus menunggu pemanggil berikutnya. Bukti
+sebelum/sesudah: `artifacts/perf/repro-dispose-stall.mjs` dan
+`artifacts/perf/repro-dispose-stall-real.mjs`.
 
 ### 12.3 Alur kerja yang sesuai dengan repo
 
