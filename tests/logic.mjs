@@ -472,12 +472,24 @@ test('snapshot: a row older than ten minutes still seeds the boot inside the def
 
 test('config: invalid values fall back to defaults and the route reports them', async () => {
   const fake = makeFake()
-  apply(fake.ctx, { listTtlMs: -5, maxEntries: 1.5, snapshotMaxAgeMs: 'soon' })
+  apply(fake.ctx, { listTtlMs: -5, snapshotMaxAgeMs: 'soon' })
   await fake.list()
   const m = fake.metrics()
   assert.equal(m.config.listTtlMs, 750)
-  assert.equal(m.config.maxEntries, 24)
   assert.equal(m.config.snapshotMaxAgeMs, 86_400_000)
+})
+
+test('config: the removed inert keys are gone from the reported config', async () => {
+  // maxEntries and maxTotalEvents belonged to the inspect cache that host
+  // 0.2.0-rc.2 removed. They did nothing since 2026-10-10, so they are gone
+  // instead of being reported as if they were live knobs. A patch that still
+  // sets them is ignored.
+  const fake = makeFake()
+  apply(fake.ctx, { maxEntries: 24, maxTotalEvents: 250000 })
+  await fake.list()
+  const m = fake.metrics()
+  assert.equal('maxEntries' in m.config, false)
+  assert.equal('maxTotalEvents' in m.config, false)
 })
 
 test('config: explicit zero TTL with zero stale window rescans every call', async () => {

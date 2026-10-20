@@ -113,8 +113,6 @@ terakhir mendarat.
 | `listMaxStaleMs` | `30000` | Jendela tambahan setelah TTL habis |
 | `snapshotMaxAgeMs` | `86400000` | Umur snapshot yang boleh dipakai untuk boot. 24 jam, bukan 10 menit: baris hanya ditulis ulang setelah scan, jadi jeda "idle lalu restart" sering lebih panjang dari jendela pendek |
 | `snapshotPath` | turunan | Lokasi file SQLite snapshot |
-| `maxEntries` | `24` | Inert sejak 2026-10-10, sisa kapasitas LRU `inspect` yang sudah dihapus. Tetap divalidasi dan dilaporkan |
-| `maxTotalEvents` | `250000` | Inert sejak 2026-10-10, sisa anggaran event cache yang sudah dihapus |
 
 **Endpoint HTTP** (dipasang di web server host):
 
@@ -140,7 +138,7 @@ terakhir mendarat.
 
 ## 10. Kriteria penerimaan
 
-- [ ] `node tests/logic.mjs` → `28/28 pass`, exit 0
+- [ ] `node tests/logic.mjs` → `30/30 pass`, exit 0
 - [ ] `node tests/runtime-smoke.mjs` → `STATUS: PROVEN`, exit 0 (host terisolasi, bukan host yang sedang jalan)
 - [ ] Baris `[session-readcache] mounted (mode=list-memo, ...)` muncul di log boot host
 - [ ] `GET /plugin/session-readcache/metrics` menjawab `200` dengan JSON, dan `mode` bernilai `list-memo`
@@ -152,7 +150,7 @@ terakhir mendarat.
 
 | Yang diklaim | Perintah | Keluaran yang diharapkan |
 | --- | --- | --- |
-| Kontrak unit | `node tests/logic.mjs` | `28/28 pass` |
+| Kontrak unit | `node tests/logic.mjs` | `30/30 pass` |
 | Bukti lewat batas host | `node tests/runtime-smoke.mjs` | `STATUS: PROVEN` |
 | Balasan dari memo tidak menunggu pemindaian | `node artifacts/perf/repro-dispose-stall.mjs` | `PASS`, reply 0,1 ms |
 | Idem pada korpus asli | `node --import <tsx> artifacts/perf/repro-dispose-stall-real.mjs` | `PASS`, reply 4 ms |
@@ -169,9 +167,15 @@ terakhir bukan perintah yang bisa dijalankan dari repo yang dikloning.
    `lifecycle.disposedInvalidations`, karena memo tidak lagi dibuang. Kalau ada
    konsumen luar endpoint metrik, kunci lama bisa dikembalikan sebagai alias
    satu rilis.
-2. **Opsi inert.** `maxEntries` dan `maxTotalEvents` tidak lagi melakukan apa-apa.
-   Menghapusnya mengubah bentuk konfigurasi; membiarkannya membuat metrics
-   melaporkan angka yang tidak pernah dipakai.
+2. **Opsi inert. SUDAH DIPUTUSKAN 2026-10-21: C1, dihapus.** `maxEntries` dan
+   `maxTotalEvents` tidak lagi melakukan apa-apa sejak 2026-10-10 (sisa cache
+   `inspect` yang dihapus bersama host `0.2.0-rc.2`). Keduanya dihapus dari
+   `DEFAULTS`, dari validasi config, dari metrics, dari `cordis.patch.yml`, dan
+   dari test. Alasannya: metrics berhenti melaporkan angka yang tidak pernah
+   dipakai, jadi tidak ada yang salah baca. Trade-off yang dicatat: bentuk
+   `config` di endpoint metrics berubah, dan patch lama yang masih menyebut
+   kedua kunci itu diabaikan tanpa efek. Varian C2 (tandai sebagai `inert` di
+   metrics) tidak diambil karena menambah field baru tanpa menghapus apa pun.
 3. **Salinan per pemanggil.** Kontrak "satu pemanggil tidak bisa mengotori
    pemanggil lain" membuat setiap balasan O(jumlah sesi). Melepas kontrak itu
    membuat balasan O(1), tapi mengubah perilaku yang dijanjikan README.
