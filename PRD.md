@@ -31,6 +31,7 @@ sesinya berisi ribuan log, lalu daftar sesi jadi terasa seperti macet.
 | `list()` setelah satu `session/disposed` | 2.640 ms sebelum fix, 4 ms sesudahnya | `artifacts/perf/repro-dispose-stall-real.mjs` |
 | Serialisasi snapshot 4.016 header | 2,9-4,0 ms, sebelumnya di jalur respons pemanggil | `artifacts/perf/probe-snapshot-response-path.mjs` |
 | Korpus yang diukur | 4.016 log, 2,3 GB | `du -sh /home/administrator/agent-workspace/.dsh/sessions` |
+| Seed boot saat restart | Ditolak: baris berumur 56 menit, jendela 10 menit, jadi reply pertama membayar scan penuh | `curl http://127.0.0.1:13080/plugin/session-readcache/metrics` (catatan `snapshot too old (3357s)`) |
 
 Yang membuat masalah ini tidak bisa diselesaikan di host: `list()` adalah
 method baca yang dipanggil dua pemanggil in-tree, `session-query`
@@ -91,7 +92,7 @@ Kesegaran adalah trade-off yang disengaja, jadi batasnya ditulis eksplisit:
 | Keadaan | Umur paling tua yang masih dilayani |
 | --- | --- |
 | Setelah scan nyata terakhir | `listMaxStaleMs` (30 detik dengan default) |
-| Setelah seed dari snapshot saat boot | `snapshotMaxAgeMs + listTtlMs + listMaxStaleMs` (10 menit + 750 ms + 30 detik dengan default). Terukur: seed ditolak saat restart karena snapshot berumur 56 menit |
+| Setelah seed dari snapshot saat boot | `snapshotMaxAgeMs + listTtlMs + listMaxStaleMs` (24 jam + 750 ms + 30 detik dengan default). Terukur: seed ditolak saat restart dengan jendela 10 menit karena snapshot berumur 56 menit; jendela dinaikkan ke 24 jam |
 | Setelah `session/disposed` | `listMaxStaleMs`, untuk baris sesi yang dibuang tapi belum pernah ditulis ke disk |
 
 `session/disposed` tidak lagi membuang memo. Baris sesi yang dibuang masih bisa
@@ -110,7 +111,7 @@ terakhir mendarat.
 | `enabled` | `true` | `false` mematikan plugin |
 | `listTtlMs` | `750` | Umur memo yang masih dianggap segar |
 | `listMaxStaleMs` | `30000` | Jendela tambahan setelah TTL habis |
-| `snapshotMaxAgeMs` | `600000` | Umur snapshot yang boleh dipakai untuk boot |
+| `snapshotMaxAgeMs` | `86400000` | Umur snapshot yang boleh dipakai untuk boot. 24 jam, bukan 10 menit: baris hanya ditulis ulang setelah scan, jadi jeda "idle lalu restart" sering lebih panjang dari jendela pendek |
 | `snapshotPath` | turunan | Lokasi file SQLite snapshot |
 | `maxEntries` | `24` | Inert sejak 2026-10-10, sisa kapasitas LRU `inspect` yang sudah dihapus. Tetap divalidasi dan dilaporkan |
 | `maxTotalEvents` | `250000` | Inert sejak 2026-10-10, sisa anggaran event cache yang sudah dihapus |
@@ -145,6 +146,7 @@ terakhir mendarat.
 - [ ] `GET /plugin/session-readcache/metrics` menjawab `200` dengan JSON, dan `mode` bernilai `list-memo`
 - [ ] `list.hits` atau `list.staleServed` naik setelah daftar sesi dibuka berulang
 - [ ] `snapshot.saves` naik setelah scan selesai, dan `snapshot.failures` tetap `0`
+- [ ] Setelah restart dengan baris snapshot yang lebih muda dari `snapshotMaxAgeMs`, `snapshot.seeded` bernilai `true` dan panggilan pertama dilayani tanpa scan
 
 ## 11. Verifikasi
 
@@ -177,13 +179,16 @@ terakhir bukan perintah yang bisa dijalankan dari repo yang dikloning.
    membuang barisnya. Batas yang lebih rapat bisa diambil dengan
    `target.stat(id)` milik host, tapi menambah ketergantungan API host baru di
    jalur event.
-5. **Jendela seed boot.** `snapshotMaxAgeMs` bawaan 10 menit lebih sempit dari
-   jeda \"idle lalu restart\" yang paling sering terjadi. Terukur di host hidup:
-   saat restart, snapshot terakhir berumur 56 menit, seed ditolak
-   (`snapshot too old (3357s); rescanning`), dan reply pertama membayar scan
-   penuh. Dua jalan menutupnya: naikkan jendela ke 24 jam (satu baris config,
-   tanpa I/O baru), atau tulis ulang snapshot secara berkala (kode baru plus
-   penulisan 4,7 MB per siklus).
+5. **Jendela seed boot. SUDAH DIPUTUSKAN 2026-10-21: C1, jendela 24 jam.**
+   `snapshotMaxAgeMs` bawaan 10 menit lebih sempit dari jeda \"idle lalu
+   restart\" yang paling sering terjadi. Terukur di host hidup: saat restart,
+   snapshot terakhir berumur 56 menit, seed ditolak (`snapshot too old (3357s);
+   rescanning`), dan reply pertama membayar scan penuh. Jendelanya dinaikkan ke
+   24 jam (`86_400_000`) di `cordis.patch.yml` dan di `DEFAULTS`. Alasannya: satu
+   baris config, nol kode dan nol I/O baru, dan isinya cuma daftar sesi yang
+   perubahannya lambat. Trade-off yang dicatat: reply pertama sesudah restart
+   bisa basi sampai 24 jam. Varian C2 (tulis ulang snapshot secara berkala)
+   tidak diambil karena menambah timer dan penulisan 4,7 MB per siklus.
 
 ## 13. Prinsip yang tidak boleh dilanggar
 

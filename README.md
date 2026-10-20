@@ -220,7 +220,7 @@ Semua kunci opsional. Nilai di bawah adalah default yang tertera di
 | `maxTotalEvents` | `250000` | **Inert sejak 2026-10-10** (dulu anggaran event cache); tetap divalidasi dan dilaporkan | tidak, lihat `lib/index.js:53-60` |
 | `listTtlMs` | `750` | Selama jendela ini hasil scan `list()` dianggap segar dan dilayani sebagai hit | ya, `0` membuat memo selalu basi (`lib/index.js:53-60`) |
 | `listMaxStaleMs` | `30000` | Setelah TTL habis tapi masih di dalam jendela ini, hasil scan terakhir dikembalikan sambil refresh berjalan di belakang | ya, `0` mempertahankan perilaku TTL ketat (`lib/index.js:53-60`) |
-| `snapshotMaxAgeMs` | `600000` | Umur maksimum snapshot yang boleh mengisi memo saat boot. Terukur 2026-10-21: 10 menit terlalu sempit untuk jeda "idle lalu restart", jadi seed ditolak saat restart (bagian 7.4) | ya, `0` mematikan boot seeding (`lib/index.js:53-60`) |
+| `snapshotMaxAgeMs` | `86400000` | Umur maksimum snapshot yang boleh mengisi memo saat boot. 24 jam, bukan 10 menit: baris hanya ditulis ulang setelah scan, jadi jeda "idle lalu restart" sering lebih panjang dari jendela pendek (bagian 7.4) | ya, `0` mematikan boot seeding (`lib/index.js:53-60`) |
 | `snapshotPath` | diturunkan | Lokasi file snapshot SQLite secara eksplisit | string kosong berarti pakai turunan (`lib/index.js:356-357`) |
 
 Contoh bentuk konfigurasi, diambil dari `cordis.patch.yml`:
@@ -234,7 +234,7 @@ Contoh bentuk konfigurasi, diambil dari `cordis.patch.yml`:
         maxTotalEvents: 250000
         listTtlMs: 750
         listMaxStaleMs: 30000
-        snapshotMaxAgeMs: 600000
+        snapshotMaxAgeMs: 86400000
 ```
 
 Semua nilai di atas adalah nilai yang benar-benar ada di file, bukan placeholder.
@@ -428,7 +428,7 @@ Plugin memberi dua tanda bahwa ia benar-benar terpasang:
    (`lib/index.js:695`):
 
    ```text
-   [session-readcache] mounted (maxEntries=24, maxTotalEvents=250000, listTtlMs=750, listMaxStaleMs=30000, snapshotMaxAgeMs=600000)
+   [session-readcache] mounted (maxEntries=24, maxTotalEvents=250000, listTtlMs=750, listMaxStaleMs=30000, snapshotMaxAgeMs=86400000)
    ```
 
    Baris ini ditulis dua kali, sekali ke `process.stderr` dan sekali ke
@@ -474,7 +474,7 @@ Bentuk responsnya diambil dari handler di `lib/index.js`:
   "list": { "hits": 0, "misses": 0, "staleServed": 0 },
   "lifecycle": { "disposedInvalidations": 0, "purgeDrops": 0 },
   "memo": { "warm": false, "ageMs": null, "inflight": false },
-  "config": { "maxEntries": 24, "listTtlMs": 750, "listMaxStaleMs": 30000, "snapshotMaxAgeMs": 600000, "maxTotalEvents": 250000 },
+  "config": { "maxEntries": 24, "listTtlMs": 750, "listMaxStaleMs": 30000, "snapshotMaxAgeMs": 86400000, "maxTotalEvents": 250000 },
   "snapshot": { "path": null, "seedResolved": false, "seeded": false, "saves": 0, "failures": 0, "notes": [] }
 }
 ```
@@ -594,11 +594,12 @@ memanaskan memo lagi; yang membuktikannya ada di test `lifecycle: a disposed
 session must not make the next list() wait for a scan` dan di skrip
 `artifacts/perf/repro-dispose-stall.mjs`.
 
-Baris seed boot menunjukkan celah nyata: `snapshotMaxAgeMs` bawaan 10 menit,
-tapi snapshot terakhir berumur 56 menit saat host dimuat ulang, jadi seed
-ditolak dan reply pertama membayar scan penuh. Isi snapshot adalah daftar sesi,
-perubahannya lambat, jadi jendela 10 menit itu lebih sempit dari jeda
-"idle lalu restart" yang paling sering terjadi. Angka di tabel ini diukur pada satu host dan satu waktu;
+Baris seed boot menunjukkan celah nyata yang sudah ditutup: `snapshotMaxAgeMs`
+bawaan 10 menit, tapi snapshot terakhir berumur 56 menit saat host dimuat ulang,
+jadi seed ditolak dan reply pertama membayar scan penuh. Jendelanya sekarang 24
+jam (baris 2026-10-21). Isi snapshot adalah daftar sesi yang perubahannya lambat,
+jadi staleness 24 jam jauh lebih murah daripada scan 2,6-77 detik yang
+dibuka pengguna di awal pakai. Angka di tabel ini diukur pada satu host dan satu waktu;
 perlakukan sebagai catatan pengukuran, bukan jaminan.
 
 ---
@@ -1306,7 +1307,7 @@ data jadi lebih lama basi.
 Hanya dalam satu hal: reply `list()` bisa sampai `listMaxStaleMs` basi setelah
 scan nyata terakhir, atau sampai `snapshotMaxAgeMs + listTtlMs + listMaxStaleMs`
 basi setelah seed dari snapshot saat boot. Dengan default yang dikirim, batas
-terburuk itu 10 menit + 750 ms + 30 detik. `session/disposed` tidak lagi membuang
+terburuk itu 24 jam + 750 ms + 30 detik. `session/disposed` tidak lagi membuang
 memo, jadi baris sesi yang dibuang masih bisa muncul sampai penyegaran selesai;
 batasnya sama dengan jendela stale itu juga. Sesi yang sedang aktif tidak pernah
 disentuh.

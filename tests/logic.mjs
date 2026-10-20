@@ -328,8 +328,10 @@ test('snapshot: a row of flat headers is refused, not served (the live seeding f
 test('snapshot: a row older than snapshotMaxAgeMs is not served', async () => {
   const fake = makeFake()
   const snapshotPath = join(fake.dir, 'snap.db')
-  plantSnapshot(snapshotPath, [{ header: { id: 'old', cwd: '/p1', createdAt: 1 }, revision: 'r' }], Date.now() - 7_000_000)
-  apply(fake.ctx, { snapshotPath })
+  // The window is configured here, not taken from the default, so this test
+  // pins the RULE and stays valid when the default window moves.
+  plantSnapshot(snapshotPath, [{ header: { id: 'old', cwd: '/p1', createdAt: 1 }, revision: 'r' }], Date.now() - 600_000)
+  apply(fake.ctx, { snapshotPath, snapshotMaxAgeMs: 60_000 })
   await fake.list()
   assert.equal(fake.service.listCalls, 1)
   assert.equal(fake.metrics().snapshot.seeded, false)
@@ -453,6 +455,19 @@ test('purge: the endpoint clears the memo', async () => {
   assert.equal(fake.metrics().lifecycle.purgeDrops, 1)
 })
 
+test('snapshot: a row older than ten minutes still seeds the boot inside the default window', async () => {
+  // The 2026-10-21 live gap: the row was 56 min old at boot and the old
+  // 10 min default refused it, so the first reply paid a full scan. The
+  // default window is 24 h now, so a row of that age is served.
+  const fake = makeFake()
+  const snapshotPath = join(fake.dir, 'snap.db')
+  plantSnapshot(snapshotPath, [{ header: { id: 'idle-hour', cwd: '/p1', createdAt: 1 }, revision: 'r' }], Date.now() - 3_600_000)
+  apply(fake.ctx, { snapshotPath })
+  await fake.list()
+  assert.equal(fake.service.listCalls, 0, 'the seed must answer the first call')
+  assert.equal(fake.metrics().snapshot.seeded, true)
+})
+
 // --- config -------------------------------------------------------------------
 
 test('config: invalid values fall back to defaults and the route reports them', async () => {
@@ -462,7 +477,7 @@ test('config: invalid values fall back to defaults and the route reports them', 
   const m = fake.metrics()
   assert.equal(m.config.listTtlMs, 750)
   assert.equal(m.config.maxEntries, 24)
-  assert.equal(m.config.snapshotMaxAgeMs, 600_000)
+  assert.equal(m.config.snapshotMaxAgeMs, 86_400_000)
 })
 
 test('config: explicit zero TTL with zero stale window rescans every call', async () => {
