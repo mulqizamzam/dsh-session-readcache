@@ -21,7 +21,7 @@ const BOOT_TIMEOUT_MS = 90_000
 const POLL_MS = 250
 
 function fail(message, detail) {
-  console.error(`\nSTATUS: UNVERIFIED — ${message}`)
+  console.error(`\nSTATUS: UNVERIFIED: ${message}`)
   if (detail) console.error(detail)
   process.exit(1)
 }

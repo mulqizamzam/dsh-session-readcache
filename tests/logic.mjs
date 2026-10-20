@@ -215,7 +215,7 @@ test('list: concurrent calls share one scan', async () => {
 // The host's list() takes an OPTIONS BAG ({signal?}), not a signal. Reading
 // the first argument as if it were the signal made every real caller bypass
 // the memo: the live host recorded 15 misses, 0 hits.
-test('list: a caller passing {signal} — the real options contract — is served from the memo', async () => {
+test('list: a caller passing {signal}, the real options contract, is served from the memo', async () => {
   const fake = makeFake()
   apply(fake.ctx, {})
   await fake.list()
