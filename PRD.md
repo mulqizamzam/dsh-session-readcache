@@ -1,6 +1,6 @@
 # PRD: dsh-session-readcache
 
-Status: aktif. Versi plugin `0.1.0`. Terakhir diperbarui 2026-10-20.
+Status: aktif. Versi plugin `0.1.0`. Terakhir diperbarui 2026-10-21.
 
 Dokumen ini menyatakan apa yang harus benar dari plugin ini, bagaimana
 buktinya, dan mana yang belum selesai. README.md adalah cara pakainya; PRD ini
@@ -13,10 +13,11 @@ diukur ulang di host ini diberi label sebagai rekaman repo.
 `sessionPersistence.list()` di memori, supaya membuka daftar sesi di GUI tidak
 menunggu pemindaian direktori setiap kali.
 
-Masalahnya nyata dan terukur di host ini: satu pemindaian `list()` atas korpus
-4.016 log.session memakan 2,6 detik saat page cache hangat dan 77,7 detik saat
-page cache kosong. Setelah di-cache, balasan yang sama sampai dalam 1,4
-milidetik.
+Masalahnya nyata dan terukur di host ini. Scan `list()` host yang sesungguhnya
+atas korpus 5.343 log memakan median 12,9 detik, dari tiga scan berturut-turut
+10,3 / 12,9 / 14,4 detik (`tools/measure-stat-cost.mjs`, 2026-10-21). Setelah
+di-cache, balasan yang sama sampai dalam 1,4 milidetik (angka rekaman
+2026-10-20 atas 4.016 header).
 
 Pengguna yang utama adalah orang yang menjalankan DSH lama-lama sampai folder
 sesinya berisi ribuan log, lalu daftar sesi jadi terasa seperti macet.
@@ -25,12 +26,17 @@ sesinya berisi ribuan log, lalu daftar sesi jadi terasa seperti macet.
 
 | Gejala | Angka | Sumber |
 | --- | --- | --- |
-| `list()` memindai seluruh direktori sesi dan mengurai header tiap log | 2.150-2.616 ms, empat run | `artifacts/perf/verify-slowscan.mjs` |
-| Pemindaian yang sama saat page cache host kosong | 77.680 ms | idem |
-| Balasan dari memo untuk 4.016 header | 1,4-3,8 ms | idem |
-| `list()` setelah satu `session/disposed` | 2.640 ms sebelum fix, 4 ms sesudahnya | `artifacts/perf/repro-dispose-stall-real.mjs` |
-| Serialisasi snapshot 4.016 header | 2,9-4,0 ms, sebelumnya di jalur respons pemanggil | `artifacts/perf/probe-snapshot-response-path.mjs` |
-| Korpus yang diukur | 4.016 log, 2,3 GB | `du -sh /home/administrator/agent-workspace/.dsh/sessions` |
+| `list()` memindai seluruh direktori sesi dan mengurai header tiap log | 2,15-2,62 detik, empat run, diukur lewat scan pengganti, bukan `list()` host yang sesungguhnya. Tidak direproduksi ulang pada 2026-10-21 | `tools/measure-session-scan.mjs` |
+| Pemindaian yang sama saat page cache host kosong | 77,7 detik. Tidak terukur ulang pada 2026-10-21: page cache tidak bisa dikosongkan tanpa hak root tanpa mengganggu host yang sedang jalan, jadi nilainya tidak diketahui, bukan nol | idem |
+| Scan `list()` host yang sesungguhnya, korpus 5.343 log | 10,3 / 12,9 / 14,4 detik (tiga scan berturut-turut), median 12,9 detik. Antar-run scan ini berada di 7,7 sampai 17,6 detik (tujuh run), jadi penyebut rasio bergerak jauh | `tools/measure-stat-cost.mjs` |
+| `stat()` untuk log generasi-4, 25% sesi | median 40,4 ms, maksimum 48,2 ms. Antar-run mediannya 29 sampai 40 ms | idem |
+| `stat()` untuk log generasi-0, 75% sesi | median 1,96 detik, maksimum 3,30 detik. Antar-run mediannya 1,4 sampai 2,0 detik | idem |
+| Biaya latar satu `session/disposed` sebelum aturan dipersempit | median 2,28 detik, di luar jalur pemanggil | idem |
+| Biaya latar satu `session/disposed` sesudah aturan dipersempit | nol untuk sesi yang sudah punya artifact di disk; median 40,3 ms untuk sesi yang belum pernah ditulis | idem |
+| Balasan dari memo untuk 4.016 header | 1,4-3,8 ms | `tools/measure-session-scan.mjs` |
+| `list()` setelah satu `session/disposed` | 2,64 detik sebelum fix, 4 ms sesudahnya | `tools/repro-dispose-stall-real.mjs` |
+| Serialisasi snapshot 4.016 header | 2,9-4,0 ms, sebelumnya di jalur respons pemanggil | `tools/probe-snapshot-response-path.mjs` |
+| Korpus yang diukur | 4.016 log, 2,3 GB (2026-10-20); 5.343 log (2026-10-21) | `du -sh /home/administrator/agent-workspace/.dsh/sessions` |
 | Seed boot saat restart | Ditolak: baris berumur 56 menit, jendela 10 menit, jadi reply pertama membayar scan penuh | `curl http://127.0.0.1:13080/plugin/session-readcache/metrics` (catatan `snapshot too old (3357s)`) |
 
 Yang membuat masalah ini tidak bisa diselesaikan di host: `list()` adalah
@@ -72,12 +78,13 @@ Empat mekanisme, semuanya di `lib/index.js`:
 | FR-13 | Konfigurasi di luar domain jatuh ke default dan nama kuncinya disebut di log mount | `config: invalid values fall back to defaults and the route reports them` |
 | FR-14 | `enabled: false` mematikan plugin tanpa meninggalkan route | `mount: disabled by config leaves no routes` |
 | FR-15 | Service tanpa `list()` tetap mount dalam mode `inert` dan tetap melaporkan metrik | `mount: a persistence without list() mounts inert but still exposes metrics` |
+| FR-16 | Pada `session/disposed`, plugin bertanya ke host apakah sesi itu masih terdaftar, dan mencabut baris itu kalau host menjawab sesi sudah tidak ada. Baris yang sudah punya artifact dipertahankan tanpa menanyakan host, dan `stat` yang menolak juga mempertahankan baris | `dispose: the plugin removes the row when the host says the session is gone, and the caller is served from memory`, `dispose: a session the host still knows keeps its row`, `dispose: a materialized row is kept without asking the host`, `dispose: a stat() that rejects keeps the row and never rejects out of the listener`, `dispose: a persistence without stat() keeps the row and the listener does not throw` |
 
 ## 5. Persyaratan non-fungsional
 
 | ID | Persyaratan | Ambang terukur |
 | --- | --- | --- |
-| NFR-1 | Balasan dari memo tidak boleh lebih lambat dari pemindaian yang dihindarinya | 1,4-3,8 ms untuk 4.016 header, terhadap 2,6-77,7 ms untuk pemindaian |
+| NFR-1 | Balasan dari memo tidak boleh lebih lambat dari pemindaian yang dihindarinya | 1,4-3,8 ms untuk 4.016 header, terhadap median scan 12,9 detik atas 5.343 log |
 | NFR-2 | Plugin bersifat advisory: kegagalan di lapisan cache selalu jatuh ke method asli | Tidak ada exception yang keluar dari `list()`; setiap jalur tulis snapshot di-`try`/`catch` |
 | NFR-3 | Plugin hanya membungkus method baca | Hanya `list` yang di-`defineProperty`; `load`, `prepare`, dan penulisan tidak pernah dibungkus |
 | NFR-4 | Plugin tidak menulis ke log sesi | Nol jalur tulis yang disentuh |
@@ -93,14 +100,34 @@ Kesegaran adalah trade-off yang disengaja, jadi batasnya ditulis eksplisit:
 | --- | --- |
 | Setelah scan nyata terakhir | `listMaxStaleMs` (30 detik dengan default) |
 | Setelah seed dari snapshot saat boot | `snapshotMaxAgeMs + listTtlMs + listMaxStaleMs` (24 jam + 750 ms + 30 detik dengan default). Terukur: seed ditolak saat restart dengan jendela 10 menit karena snapshot berumur 56 menit; jendela dinaikkan ke 24 jam |
-| Setelah `session/disposed` | `listMaxStaleMs`, untuk baris sesi yang dibuang tapi belum pernah ditulis ke disk |
+| Setelah `session/disposed`, untuk baris sesi yang dibuang | Sampai penyegaran di belakang selesai, sama seperti sebelum C1, karena pada event dispose host masih menjawab "terdaftar". Baris hilang lebih awal kalau host menjawab "tidak terdaftar", dan itu yang terjadi pada host yang menjawab dari disk |
+| Setelah `session/disposed`, untuk sisa isi memo | `listMaxStaleMs` (30 detik dengan default), sampai penyegaran di belakang selesai |
 
-`session/disposed` tidak lagi membuang memo. Baris sesi yang dibuang masih bisa
-muncul sampai penyegaran selesai, dan itu satu-satunya tempat di mana memo
-berbeda dari jawaban host. Yang berubah sejak host `0.2.0-rc.2` menghapus
-`inspect`: jalur `list()` hanya mengembalikan header sesi, dan header
-(`id`, `createdAt`, `cwd`, `version`, `isSeeded`) tidak berubah saat flush
-terakhir mendarat.
+`session/disposed` tidak lagi membuang memo; memo ditandai basi. Plugin hanya
+menanyakan host untuk baris sesi yang belum pernah ditulis ke disk, dan
+mencabut baris itu kalau host menjawab sesi sudah tidak ada. Baris yang sudah
+punya artifact dipertahankan tanpa menanyakan host, karena `list()` milik host
+masih menyebut sesi itu.
+
+Yang berubah sejak host `0.2.0-rc.2` menghapus `inspect`: jalur `list()` hanya
+mengembalikan header sesi, dan header (`id`, `createdAt`, `cwd`, `version`,
+`isSeeded`) tidak berubah saat flush terakhir mendarat.
+
+Pada event dispose, plugin bertanya ke host apakah sesi itu masih terdaftar. Di
+host ini jawabannya masih "terdaftar" saat itu, karena host menjawab dari tracker
+in-memory dan baru melepas sesinya setelah handle tulis ditutup; jadi barisnya
+bertahan sampai penyegaran di belakang selesai, seperti sebelum C1. Baris baru
+hilang lebih awal kalau host menjawab "tidak terdaftar", dan itu yang terjadi
+pada host yang menjawab dari disk. Jalur `delete()` juga tidak memberi tahu
+plugin: `delete()` tidak mempublikasikan `session/disposed`, jadi baris yang
+dihapus dari store juga bertahan di memo sampai penyegaran berikutnya. Karena
+itu `disposeRowsRemoved` membaca 0 pada host ini. Itu informasi, bukan kegagalan.
+
+Jawaban `stat()` datang asynchronous, dan memo tidak pernah dibuang selama
+jawabannya belum tiba. Kalau `stat` menolak atau `target.stat` bukan fungsi,
+baris dipertahankan karena jawaban "tidak terdaftar" belum terbukti; baris itu
+hilang saat penyegaran di belakang selesai, dan penyegaran itu sudah dijadwalkan
+oleh dispose yang sama.
 
 ## 7. Antarmuka
 
@@ -134,11 +161,11 @@ terakhir mendarat.
 | Baris snapshot rusak atau ditulis build lain | Loader menolak baris yang bukan snapshot sesi, yang terlalu besar, yang versinya beda, atau yang stempelnya di masa depan | Empat test menolak bentuk itu, `SNAPSHOT_MAX_BYTES` membatasi ukuran baris |
 | Kunci prototipe masuk ke objek pemanggil | `copy()` membangun ulang snapshot dan header-nya key demi key | `list: prototype-reaching keys are stripped from the snapshot and its header` |
 | Endpoint purge dipanggil tanpa sengaja | `GET` ditolak, `POST` hanya | Route menjawab `405` untuk metode lain |
-| Salinan per pemanggil membuat balasan O(jumlah sesi) | 1,4-3,8 ms untuk 4.016 header | Biaya 0,05 % dari pemindaian yang dihindarinya. Tidak diubah karena kontrak "pemanggil tidak bisa mengotori memo" |
+| Salinan per pemanggil membuat balasan O(jumlah sesi) | 1,4-3,8 ms untuk 4.016 header | Biaya di bawah 0,1 % dari pemindaian yang dihindarinya (3,8 ms terhadap median scan 12,9 detik). Tidak diubah karena kontrak "pemanggil tidak bisa mengotori memo" |
 
 ## 10. Kriteria penerimaan
 
-- [ ] `node tests/logic.mjs` → `30/30 pass`, exit 0
+- [ ] `node tests/logic.mjs` → `37/37 pass`, exit 0
 - [ ] `node tests/runtime-smoke.mjs` → `STATUS: PROVEN`, exit 0 (host terisolasi, bukan host yang sedang jalan)
 - [ ] Baris `[session-readcache] mounted (mode=list-memo, ...)` muncul di log boot host
 - [ ] `GET /plugin/session-readcache/metrics` menjawab `200` dengan JSON, dan `mode` bernilai `list-memo`
@@ -150,12 +177,12 @@ terakhir mendarat.
 
 | Yang diklaim | Perintah | Keluaran yang diharapkan |
 | --- | --- | --- |
-| Kontrak unit | `node tests/logic.mjs` | `30/30 pass` |
+| Kontrak unit | `node tests/logic.mjs` | `37/37 pass` |
 | Bukti lewat batas host | `node tests/runtime-smoke.mjs` | `STATUS: PROVEN` |
-| Balasan dari memo tidak menunggu pemindaian | `node artifacts/perf/repro-dispose-stall.mjs` | `PASS`, reply 0,1 ms |
-| Idem pada korpus asli | `node --import <tsx> artifacts/perf/repro-dispose-stall-real.mjs` | `PASS`, reply 4 ms |
-| Memo tetap converge ke kebenaran host | `node artifacts/perf/verify-dispose-convergence.mjs` | `8/8 checks pass` |
-| Serialisasi tidak di jalur respons | `node artifacts/perf/probe-snapshot-response-path.mjs` | `scan-resolved -> caller-resumed -> stringify` |
+| Balasan dari memo tidak menunggu pemindaian | `node tools/repro-dispose-stall.mjs` | `PASS`, reply 0,1 ms |
+| Idem pada korpus asli | `node --import <tsx> tools/repro-dispose-stall-real.mjs` | `PASS`, reply 4 ms |
+| Memo tetap converge ke kebenaran host | `node tools/verify-dispose-convergence.mjs` | `8/8 checks pass` |
+| Serialisasi tidak di jalur respons | `node tools/probe-snapshot-response-path.mjs` | `scan-resolved -> caller-resumed -> stringify` |
 | Memo bertahan lintas dispose di host hidup | `curl http://127.0.0.1:13080/plugin/session-readcache/metrics` | `memo.warm:true` sementara `disposedInvalidations:6` |
 
 Skrip di `artifacts/` tidak ikut ter-commit (folder itu di-ignore), jadi baris
@@ -164,9 +191,12 @@ terakhir bukan perintah yang bisa dijalankan dari repo yang dikloning.
 ## 12. Keputusan terbuka
 
 1. **Kunci metrik berubah.** `lifecycle.disposedDrops` diganti
-   `lifecycle.disposedInvalidations`, karena memo tidak lagi dibuang. Kalau ada
-   konsumen luar endpoint metrik, kunci lama bisa dikembalikan sebagai alias
-   satu rilis.
+   `lifecycle.disposedInvalidations`, karena memo tidak lagi dibuang. Key ketiga,
+   `lifecycle.disposeRowsRemoved`, ditambahkan 2026-10-21: ia menghitung
+   dispose yang benar-benar mencabut satu baris dari memo. Di host ini
+   `disposeRowsRemoved` membaca 0, karena pada jalur dispose jawaban host selalu
+   "terdaftar"; angka nol itu informasi, bukan kegagalan. Kalau ada konsumen luar endpoint metrik, kunci lama bisa
+   dikembalikan sebagai alias satu rilis.
 2. **Opsi inert. SUDAH DIPUTUSKAN 2026-10-21: C1, dihapus.** `maxEntries` dan
    `maxTotalEvents` tidak lagi melakukan apa-apa sejak 2026-10-10 (sisa cache
    `inspect` yang dihapus bersama host `0.2.0-rc.2`). Keduanya dihapus dari
@@ -179,10 +209,60 @@ terakhir bukan perintah yang bisa dijalankan dari repo yang dikloning.
 3. **Salinan per pemanggil.** Kontrak "satu pemanggil tidak bisa mengotori
    pemanggil lain" membuat setiap balasan O(jumlah sesi). Melepas kontrak itu
    membuat balasan O(1), tapi mengubah perilaku yang dijanjikan README.
-4. **Batas baris yang dibuang.** `session/disposed` menandai memo basi, bukan
-   membuang barisnya. Batas yang lebih rapat bisa diambil dengan
-   `target.stat(id)` milik host, tapi menambah ketergantungan API host baru di
-   jalur event.
+4. **Batas baris yang dibuang. SUDAH DIPUTUSKAN 2026-10-21: C1, tanyakan host
+   dan cabut baris kalau host bilang sesi sudah tidak ada.** `session/disposed`
+   menandai memo basi, lalu
+   `target.stat(id)` milik host dipakai untuk memutuskan baris mana yang boleh
+   dicabut. Tapi host hanya ditanya untuk baris yang bisa saja tidak lagi disebut
+   `list()`, yaitu baris sesi yang hidup tapi belum pernah ditulis ke disk. Baris
+   yang sudah punya artifact di disk, yaitu baris snapshot host yang membawa
+   `sizeBytes`, dipertahankan tanpa menanyakan host: dispose hanya melepaskan
+   sesi, bukan menghapus lognya, jadi artifact itu bertahan lebih lama dari
+   sesinya, `list()` host masih menyebut sesi itu, dan baris memo-nya memang
+   benar. Aturan lengkapnya: `stat` mengembalikan snapshot -> baris
+   dipertahankan; `stat` mengembalikan `undefined` -> baris dicabut dari memo,
+   karena `list()` host juga tidak akan menyebutnya; `stat` menolak atau
+   `target.stat` bukan fungsi -> baris dipertahankan, karena ketiadaan artifact
+   belum terbukti.
+   Alasannya: `list()` host berbasis disk, jadi sesi yang tidak pernah ditulis
+   ke disk adalah satu-satunya yang akan hilang dari jawaban host, dan sesi
+   yang lognya masih ada di disk masih disebut host sehingga harus tetap ada di
+   memo. Persempitan itu juga yang membuat plugin tidak masuk kelas mahal:
+   `stat()` pada log generasi lama menghitung `historicalCorpusRevision()` yang
+   menghash SELURUH korpus, dengan median 1,96 detik di host ini, dan baris
+   seperti itu justru tidak pernah ditanyakan, karena baris itu selalu punya
+   artifact. Yang ditanyakan hanya jalur murah, dengan median 40,3 ms (sumber
+   di bagian 2).
+   Batasnya: jawaban `stat()` datang asynchronous, jadi pemanggil yang datang
+   sebelum jawabannya tiba masih bisa melihat barisnya; di host ini jawabannya
+   datang dalam puluhan milidetik, dan memo tidak pernah dibuang selama
+   jawabannya belum tiba. Sisa memo tetap basi sampai `listMaxStaleMs` (30 detik
+   dengan default), dan pemanggil berikutnya dilayani dari memori sementara
+   penyegaran berjalan di belakang.
+   Pada event dispose, plugin bertanya ke host apakah sesi itu masih terdaftar.
+   Di host ini jawabannya masih "terdaftar" saat itu, karena host menjawab dari
+   tracker in-memory dan baru melepas sesinya setelah handle tulis ditutup; jadi
+   barisnya bertahan sampai penyegaran di belakang selesai, seperti sebelum C1.
+   Baris baru hilang lebih awal kalau host menjawab "tidak terdaftar", dan itu
+   yang terjadi pada host yang menjawab dari disk. Jalur `delete()` juga tidak
+   memberi tahu plugin: `delete()` tidak mempublikasikan `session/disposed`, jadi
+   baris yang dihapus dari store juga bertahan di memo sampai penyegaran
+   berikutnya. Karena itu `disposeRowsRemoved` membaca 0 pada host ini. Itu
+   informasi, bukan kegagalan.
+   Trade-off yang dicatat: jalur event kini memanggil satu method host lagi,
+   jadi plugin bergantung pada `SessionPersistence.stat` yang ada di interface
+   host (`packages/session/session-persistence/src/index.ts`,
+   `abstract stat(id, options?)`). Varian "buang memo sepenuhnya" tidak diambil:
+   satu peristiwa satu baris tidak boleh mengubah satu baris jadi satu pemindaian
+   direktori penuh (median 12,9 detik di host ini atas korpus 5.343 log, sumber
+   di bagian 2, dan alasannya tertulis di kontrak
+   `docs/CONTRACT-c1-dispose.md`). Varian "buang baris tanpa bertanya
+   ke host" tidak diambil: `list()` host berbasis disk, jadi baris yang
+   artifact-nya masih ada tetap disebut host dan membuangnya akan membuat memo
+   berbeda dari jawaban host. Batas yang tetap ada: plugin tidak pernah diberi
+   tahu tentang sebuah delete, karena API `delete()` milik host tidak
+   memancarkan `session/disposed`, jadi log sesi yang dihapus di luar jalur
+   dispose tetap di memo sampai refresh berikutnya.
 5. **Jendela seed boot. SUDAH DIPUTUSKAN 2026-10-21: C1, jendela 24 jam.**
    `snapshotMaxAgeMs` bawaan 10 menit lebih sempit dari jeda \"idle lalu
    restart\" yang paling sering terjadi. Terukur di host hidup: saat restart,

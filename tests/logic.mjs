@@ -28,23 +28,36 @@ function isSignalLike(value) {
     typeof value.aborted === 'boolean' && typeof value.addEventListener === 'function'
 }
 
-function makeFake({ listDelayMs = 0, ids = ['s1', 's2', 's3', 's4'], withInspect = false } = {}) {
+// `withStat` mirrors a host that carries the `stat` method of
+// SessionPersistence; `unwritten` names the sessions that never reached the
+// disk (so the host's disk-based list() does NOT name them any more),
+// `materialized` names the sessions whose ROW carries `sizeBytes` (the host's
+// own statement that the session has an artifact on disk) and `statRejects`
+// names the sessions whose stat() call fails.
+function makeFake({ listDelayMs = 0, ids = ['s1', 's2', 's3', 's4'], withInspect = false, withStat = true, unwritten = [], materialized = [], statRejects = [] } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'readcache-'))
-  const calls = { list: 0, options: [] }
+  const calls = { list: 0, options: [], stat: [] }
   const live = new Set()
   // The host's real contract: list() resolves to SessionPersistenceSnapshot[]
   // — `{header, revision, ...}` — never a flat header. Both in-tree callers
   // read snapshot.header.id (session-query's listPersisted, ACP's
   // sessionList). An earlier fake returned flat headers, which is why the
   // suite passed while the live memo served zero hits.
-  const snapshots = ids.map((id, i) => ({
-    header: { id, cwd: '/p1', createdAt: 1 + i },
-    revision: `r-${id}`,
-    eventCount: i,
-  }))
+  const snapshots = ids.map((id, i) => {
+    const snapshot = { header: { id, cwd: '/p1', createdAt: 1 + i }, revision: `r-${id}`, eventCount: i }
+    // The host's list() tells the two kinds of row apart in the snapshot
+    // itself: a MATERIALIZED row (the session has an artifact on disk)
+    // carries sizeBytes, a LIVE-BUT-UNWRITTEN row (the session is created
+    // but not written yet) does not. A row without sizeBytes is the only one
+    // a dispose can make wrong, so it is the only one worth asking about.
+    if (materialized.includes(id)) snapshot.sizeBytes = 4096
+    return snapshot
+  })
+  const byId = new Map(snapshots.map((s) => [s.header.id, s]))
   const service = {
     get listCalls() { return calls.list },
     get optionsSeen() { return calls.options },
+    get statCalls() { return calls.stat.slice() },
     async list(options) {
       calls.list += 1
       calls.options.push(options)
@@ -53,6 +66,29 @@ function makeFake({ listDelayMs = 0, ids = ['s1', 's2', 's3', 's4'], withInspect
       if (signal?.aborted) throw new Error('aborted')
       return snapshots.map((s) => ({ ...s, header: { ...s.header } }))
     },
+  }
+  if (withStat) {
+    // The host's own SessionPersistence.stat(id), and the shape of its answer:
+    //   - a MATERIALIZED session (the artifact is on disk): a snapshot WITH
+    //     sizeBytes;
+    //   - a session the host still TRACKS but has not written yet: a snapshot
+    //     WITHOUT sizeBytes;
+    //   - a session the host no longer knows at all: undefined.
+    // The plugin's rule is on the ANSWER, not on the answer's sizeBytes: any
+    // resolved snapshot means the host still knows the session, so the row
+    // stays; only undefined means "gone".
+    // `unwritten` names the sessions the host does not know at all (their
+    // stat() resolves undefined). `materialized` names the sessions whose ROW
+    // carries sizeBytes, the ones a dispose must not even ask about.
+    service.stat = async (id) => {
+      calls.stat.push(id)
+      if (statRejects.includes(id)) throw new Error(`stat failed for ${id}`)
+      const snapshot = byId.get(id)
+      if (snapshot === undefined || unwritten.includes(id)) return undefined
+      const answer = { header: { ...snapshot.header }, revision: snapshot.revision }
+      if (materialized.includes(id)) answer.sizeBytes = snapshot.sizeBytes
+      return answer
+    }
   }
   if (withInspect) {
     // A host that still carries the old method must not change behaviour.
@@ -397,7 +433,7 @@ test('snapshot: a failed save is counted and noted, the caller still gets header
 test('snapshot: the serialization runs after the caller already has its reply', async () => {
   // The snapshot is a side effect: the list the caller asked for must not wait
   // for the whole list to be serialized for the disk. README 5.2 says the row
-  // is written "outside the caller's response path" — this pins that.
+  // is written "outside the caller's response path", this pins that.
   const fake = makeFake()
   const snapshotPath = join(fake.dir, 'snap.db')
   const events = []
@@ -422,11 +458,14 @@ test('snapshot: the serialization runs after the caller already has its reply', 
 
 test('lifecycle: a disposed session must not make the next list() wait for a scan', async () => {
   // A dispose is a ONE-ROW event. The list it invalidates is a WHOLE-LIST
-  // memo, and refilling it runs the host's directory scan again: measured at
-  // 2.6 s warm and 77.7 s cold over this host's 4,016-log corpus. The host's
-  // own list() is disk-based, so a detached session that was materialized is
-  // still listed by the host — the rescan reproduced the memo's own contents.
-  // The next caller must therefore be answered from memory.
+  // memo, and refilling it runs the host's directory scan again: a full scan
+  // of the session store measures 12.9 s median over 5,343 logs on this host
+  // (2026-10-21). The cold-page-cache figure was never measured, dropping
+  // the page cache would disturb the running host, so it is unknown, not
+  // zero. The host's own list() is disk-based, so a detached session that
+  // was materialized is still listed by the host, the rescan reproduced the
+  // memo's own contents. The scan is measured in seconds, so the next caller
+  // must be answered from memory rather than made to wait for one.
   const fake = makeFake({ listDelayMs: 300 })
   const listeners = new Map()
   fake.ctx.on = (event, cb) => { const l = listeners.get(event) ?? []; l.push(cb); listeners.set(event, l) }
@@ -442,6 +481,205 @@ test('lifecycle: a disposed session must not make the next list() wait for a sca
   // The memo is invalidated, not thrown away: the refresh reconciles it.
   assert.equal(fake.metrics().memo.warm, true)
   assert.equal(fake.metrics().lifecycle.disposedInvalidations, 1)
+})
+
+// --- dispose invalidation (CONTRACT C1) ---------------------------------------
+// The host's list() is disk-based: it names every session that has a
+// materialized artifact plus the live ones. A disposed session therefore
+// leaves the host's list() only when it was NEVER written to disk, and the
+// only way to tell those two apart is the host's own stat(id): a snapshot
+// means the host still knows the session, undefined means it does not. The
+// memo must drop exactly that one row, and it must do so without making the
+// next caller wait for a directory scan.
+//
+// WHAT A STUB CAN AND CANNOT PROVE. The fake below answers what the host
+// answers; it does not reproduce WHEN the host answers. On a live host the
+// answer at dispose time is "present", so the removal does not happen on the
+// dispose path, see the note on the first dispose test below.
+
+/**
+ * Let the listener's asynchronous stat() land. This is a MACROtask wait, so
+ * the stat promise AND the then-handler that applies its answer have both
+ * run before the next statement, a microtask tick would not be enough, and
+ * the removal test would pass for the wrong reason (the row still being
+ * there because the removal never happened yet).
+ */
+function settle(ms = 30) {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+/**
+ * Give the fake a ctx.on() the way a host has one, and hand back a getter for
+ * the registered dispose callbacks.
+ */
+function withDisposeListener(fake) {
+  const listeners = new Map()
+  fake.ctx.on = (event, cb) => { const l = listeners.get(event) ?? []; l.push(cb); listeners.set(event, l) }
+  return () => listeners.get('session/disposed') ?? []
+}
+
+test('dispose: the plugin removes the row when the host says the session is gone, and the caller is served from memory', async () => {
+  // WHAT THIS PINS, AND WHAT IT DOES NOT. This is a unit test of the
+  // plugin's conditional logic: GIVEN a host that answers "this session is
+  // gone" (stat resolves undefined), the plugin removes exactly that row and
+  // nothing else, and the next caller is still answered from memory.
+  //
+  // It is NOT a claim that the removal happens on a live host. There, stat()
+  // answers from the host's IN-MEMORY TRACKER before it touches disk, and at
+  // dispose time the tracker still holds the session: the backend's dispose
+  // listener starts the close without awaiting it, the tracker entry is
+  // deleted only when that close settles, and stat() has already resolved by
+  // then. So a live host answers "present", contract rule 2 fires, and the
+  // row is KEPT, the removal does not happen on the dispose path. The
+  // end-to-end witness is stat-cost's probe against a real host
+  // (artifacts/perf/probe-pending-stat.mjs); a stub cannot give one.
+  //
+  // The materialized-row test is unaffected: it pins what the plugin does
+  // NOT do, and that holds on the real host.
+  const fake = makeFake({ listDelayMs: 300, unwritten: ['s3'] })
+  const disposeListeners = withDisposeListener(fake)
+  apply(fake.ctx, {})
+  await fake.list()
+  assert.equal(fake.metrics().memo.warm, true)
+  for (const cb of disposeListeners()) cb({ id: 's3' })
+  await settle()
+  const started = Date.now()
+  const rows = await fake.list()
+  const elapsed = Date.now() - started
+  assert.equal(rows.length, 3, `the row of the session the host says is gone must be gone (the list served ${rows.length} rows)`)
+  assert.equal(rows.some((r) => r?.header?.id === 's3'), false, 's3 must not be served any more')
+  assert.deepEqual(fake.service.statCalls, ['s3'], 'the host was asked once, about the disposed session')
+  assert.ok(elapsed < 150, `the next list() waited ${elapsed} ms for a scan after a dispose`)
+  assert.ok(fake.metrics().list.staleServed >= 1, 'the caller was served from memory')
+})
+
+test('dispose: a session the host still knows keeps its row', async () => {
+  // The host answers "still known" (stat resolves a snapshot), so the row is
+  // correct and stays. The host's list() is disk-based and its tracker still
+  // names a detached session, so dropping the row would hide a session the
+  // host still has.
+  const fake = makeFake({ listDelayMs: 300 })
+  const disposeListeners = withDisposeListener(fake)
+  apply(fake.ctx, {})
+  await fake.list()
+  for (const cb of disposeListeners()) cb({ id: 's2' })
+  await settle()
+  const rows = await fake.list()
+  assert.equal(rows.length, 4, `a session the host still knows stays in the memo (the list served ${rows.length} rows)`)
+  assert.equal(rows.some((r) => r?.header?.id === 's2'), true, 's2 must still be served')
+})
+
+test('dispose: a persistence without stat() keeps the row and the listener does not throw', async () => {
+  // A host whose persistence service has no stat() at all: absence is not
+  // proven, so the row stays, and the listener must neither throw nor
+  // reject, whatever it hands back.
+  const fake = makeFake({ listDelayMs: 300, withStat: false })
+  const disposeListeners = withDisposeListener(fake)
+  apply(fake.ctx, {})
+  await fake.list()
+  const returned = []
+  for (const cb of disposeListeners()) returned.push(cb({ id: 's2' }))
+  for (const result of returned) {
+    if (result !== null && typeof result === 'object' && typeof result.then === 'function') {
+      await result
+    }
+  }
+  await settle()
+  const rows = await fake.list()
+  assert.equal(rows.length, 4, `without stat() the row must stay (the list served ${rows.length} rows)`)
+  assert.equal(rows.some((r) => r?.header?.id === 's2'), true, 's2 must still be served')
+})
+
+test('dispose: a stat() that rejects keeps the row and never rejects out of the listener', async () => {
+  // A failed stat proves nothing about the session, so the row stays and the
+  // failure is recorded; the listener must never throw and never reject.
+  const fake = makeFake({ listDelayMs: 300, statRejects: ['s2'] })
+  const disposeListeners = withDisposeListener(fake)
+  apply(fake.ctx, {})
+  await fake.list()
+  const returned = []
+  for (const cb of disposeListeners()) returned.push(cb({ id: 's2' }))
+  for (const result of returned) {
+    if (result !== null && typeof result === 'object' && typeof result.then === 'function') {
+      await result
+    }
+  }
+  await settle()
+  const rows = await fake.list()
+  assert.equal(rows.length, 4, `a failed stat() must not drop the row (the list served ${rows.length} rows)`)
+  assert.equal(rows.some((r) => r?.header?.id === 's2'), true, 's2 must still be served')
+  // Rule 4 asks for a NOTE, and the note is the only trace a swallowed
+  // failure leaves: the row stays either way, so without this the failure
+  // would be invisible. The wording is not fixed by the contract, so the
+  // assertion is on the observable, the disposed id appears in the notes the
+  // metrics endpoint exposes, not on any exact string.
+  const notes = fake.metrics().snapshot.notes.join(' ')
+  assert.match(notes, /s2/, `the failed stat must be recorded as a note (the notes say: ${notes})`)
+})
+
+test('dispose: removing a row keeps the same memo, and the seeded flag and age survive', async () => {
+  // Rule 6: the removal replaces the memo's ARRAY and nothing else. The memo
+  // stays the SAME memo, not a rebuilt, re-stamped or re-seeded one, so the
+  // `seeded` marker still describes it and its age still grows. A rebuild
+  // shows up as a fresh `at` (the age collapsing back to zero) or as a lost
+  // seeded flag. The memo is warmed from a PLANTED snapshot row here, so it
+  // is genuinely seeded and the flag is there to be lost.
+  const fake = makeFake({ unwritten: ['s3'] })
+  const snapshotPath = join(fake.dir, 'snap.db')
+  plantSnapshot(snapshotPath, [{ header: { id: 's3', cwd: '/p1', createdAt: 1 }, revision: 'r-seeded' }])
+  const disposeListeners = withDisposeListener(fake)
+  apply(fake.ctx, { snapshotPath })
+  await fake.list()
+  assert.equal(fake.service.listCalls, 0, 'the planted row must seed the memo, not a scan')
+  assert.equal(fake.metrics().snapshot.seeded, true, 'the memo is seeded')
+  // Let the memo AGE before the dispose: an age that was already 0 could not
+  // tell a re-stamp apart from a growth, and the check would be vacuous.
+  await settle(40)
+  const ageBefore = fake.metrics().memo.ageMs
+  for (const cb of disposeListeners()) cb({ id: 's3' })
+  await settle()
+  const ageAfter = fake.metrics().memo.ageMs
+  assert.ok(ageAfter >= ageBefore, `the memo was re-stamped: its age went from ${ageBefore} ms to ${ageAfter} ms`)
+  assert.equal(fake.metrics().snapshot.seeded, true, 'the removal must not unseed the memo')
+  const rows = await fake.list()
+  assert.equal(rows.length, 0, `the seeded row of the disposed session must be gone (the list served ${rows.length} rows)`)
+  assert.equal(rows.some((r) => r?.header?.id === 's3'), false, 's3 must not be served any more')
+})
+
+test('dispose: a materialized row is kept without asking the host', async () => {
+  // Rule 1, narrowed: the host is asked ONLY about a row its list() could
+  // stop naming, a LIVE-BUT-UNWRITTEN one. A MATERIALIZED row carries
+  // sizeBytes, and that artifact on disk outlives the session: a dispose
+  // detaches the session, it does not delete the log. The host still lists
+  // it, so the row is CORRECT and stays. Asking would also be the expensive
+  // question, a stat() on an old-generation log hashes the whole corpus ,
+  // and its answer for a materialized session is always "an artifact exists".
+  // So the host must not be asked AT ALL.
+  const fake = makeFake({ listDelayMs: 300, materialized: ['s2'] })
+  const disposeListeners = withDisposeListener(fake)
+  apply(fake.ctx, {})
+  await fake.list()
+  for (const cb of disposeListeners()) cb({ id: 's2' })
+  await settle()
+  assert.deepEqual(fake.service.statCalls, [], 'a materialized row must not cost the host a stat() call')
+  const rows = await fake.list()
+  assert.equal(rows.length, 4, `a materialized row stays in the memo (the list served ${rows.length} rows)`)
+  assert.equal(rows.some((r) => r?.header?.id === 's2'), true, 's2 must still be served')
+  assert.equal(rows.find((r) => r?.header?.id === 's2')?.sizeBytes, 4096, 'the served row is still the materialized one')
+})
+
+test('dispose: a session the memo does not hold does not ask the host', async () => {
+  // Rule 1: the host is asked about a session ONLY while the memo actually
+  // holds that row. A dispose of an id the memo never listed must not cost a
+  // stat() call, otherwise every dispose pays one, for a row that is not
+  // there, and the guard the contract puts on the stat call is gone.
+  const fake = makeFake({ listDelayMs: 300 })
+  const disposeListeners = withDisposeListener(fake)
+  apply(fake.ctx, {})
+  await fake.list()
+  for (const cb of disposeListeners()) cb({ id: 's9' })
+  await settle()
+  assert.deepEqual(fake.service.statCalls, [], 'the host must not be asked about a session the memo does not hold')
 })
 
 test('purge: the endpoint clears the memo', async () => {
