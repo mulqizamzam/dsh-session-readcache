@@ -1,6 +1,10 @@
 # HOST TICKET: `SessionPersistence.stat(id)` terlalu mahal, dan tidak bisa dijawab saat dispose
 
-**Status:** Draft untuk owner host (`/home/administrator/deepseek-harness`).
+**Status:** Selesai di sisi host 2026-10-21, commit `1b1b35b31d` pada
+`/home/administrator/deepseek-harness`: `SessionPersistenceStatOptions` gaining
+`source?: 'tracked' | 'disk'`, dan backend jsonl yang melewati tracker kalau
+opsinya `'disk'`. Build dan restart host belum dijalankan; perubahan belum
+terpasang di host yang sedang hidup.
 **Dialokasikan oleh:** plugin `dsh-session-readcache`.
 **Tanggal penulisan:** 2026-10-21, oleh agen (investigasi terukur, bukan eksekusi).
 

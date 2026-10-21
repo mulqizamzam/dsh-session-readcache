@@ -36,10 +36,10 @@ function isSignalLike(value) {
 // names the sessions whose stat() call fails.
 function makeFake({ listDelayMs = 0, ids = ['s1', 's2', 's3', 's4'], withInspect = false, withStat = true, unwritten = [], materialized = [], statRejects = [] } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'readcache-'))
-  const calls = { list: 0, options: [], stat: [] }
+  const calls = { list: 0, options: [], stat: [], statOptions: [] }
   const live = new Set()
   // The host's real contract: list() resolves to SessionPersistenceSnapshot[]
-  // — `{header, revision, ...}` — never a flat header. Both in-tree callers
+  //, `{header, revision, ...}`, never a flat header. Both in-tree callers
   // read snapshot.header.id (session-query's listPersisted, ACP's
   // sessionList). An earlier fake returned flat headers, which is why the
   // suite passed while the live memo served zero hits.
@@ -58,6 +58,7 @@ function makeFake({ listDelayMs = 0, ids = ['s1', 's2', 's3', 's4'], withInspect
     get listCalls() { return calls.list },
     get optionsSeen() { return calls.options },
     get statCalls() { return calls.stat.slice() },
+    get statOptions() { return calls.statOptions.slice() },
     async list(options) {
       calls.list += 1
       calls.options.push(options)
@@ -80,11 +81,17 @@ function makeFake({ listDelayMs = 0, ids = ['s1', 's2', 's3', 's4'], withInspect
     // `unwritten` names the sessions the host does not know at all (their
     // stat() resolves undefined). `materialized` names the sessions whose ROW
     // carries sizeBytes, the ones a dispose must not even ask about.
-    service.stat = async (id) => {
+    service.stat = async (id, options) => {
       calls.stat.push(id)
+      calls.statOptions.push(options ?? null)
       if (statRejects.includes(id)) throw new Error(`stat failed for ${id}`)
       const snapshot = byId.get(id)
       if (snapshot === undefined || unwritten.includes(id)) return undefined
+      // The host's DISK answer ignores the in-memory tracker: a session that
+      // was created but never written has no artifact, so it reads as absent.
+      // A host without that option answers from the tracker instead, and a
+      // session it still tracks reads as a snapshot without sizeBytes.
+      if (options?.source === 'disk' && !materialized.includes(id)) return undefined
       const answer = { header: { ...snapshot.header }, revision: snapshot.revision }
       if (materialized.includes(id)) answer.sizeBytes = snapshot.sizeBytes
       return answer
@@ -168,7 +175,7 @@ async function withClock(fns, fn) {
 // --- mount survival ---------------------------------------------------------
 // Regression: on host 0.2.0-rc.2 the persistence service no longer exposes
 // `inspect`, and apply() threw at `target.inspect.bind` BEFORE any banner or
-// route existed — the plugin was dead on production with no log line at all.
+// route existed, the plugin was dead on production with no log line at all.
 
 test('mount: the plugin mounts and memoizes with a persistence that has no inspect', async () => {
   const fake = makeFake()
@@ -519,24 +526,24 @@ function withDisposeListener(fake) {
 }
 
 test('dispose: the plugin removes the row when the host says the session is gone, and the caller is served from memory', async () => {
-  // WHAT THIS PINS, AND WHAT IT DOES NOT. This is a unit test of the
-  // plugin's conditional logic: GIVEN a host that answers "this session is
-  // gone" (stat resolves undefined), the plugin removes exactly that row and
-  // nothing else, and the next caller is still answered from memory.
+  // WHAT THIS PINS. The plugin asks the host for the DURABLE artifact
+  // (stat with source 'disk'), not for "does this process still track it".
+  // GIVEN a host that answers "this session has no artifact" (stat resolves
+  // undefined), the plugin removes exactly that row and nothing else, and the
+  // next caller is still answered from memory.
   //
-  // It is NOT a claim that the removal happens on a live host. There, stat()
-  // answers from the host's IN-MEMORY TRACKER before it touches disk, and at
-  // dispose time the tracker still holds the session: the backend's dispose
-  // listener starts the close without awaiting it, the tracker entry is
-  // deleted only when that close settles, and stat() has already resolved by
-  // then. So a live host answers "present", contract rule 2 fires, and the
-  // row is KEPT, the removal does not happen on the dispose path. The
-  // end-to-end witness is stat-cost's probe against a real host
-  // (artifacts/perf/probe-pending-stat.mjs); a stub cannot give one.
+  // WHY THE QUESTION CHANGED. The host's plain stat() answers from its
+  // IN-MEMORY TRACKER first, and at dispose time the tracker still holds the
+  // session: the backend's dispose listener starts the close without awaiting
+  // it, and the tracker entry is deleted only when that close settles. So the
+  // tracked answer is "present" for a session that was created and never
+  // written, and the row would linger until the next refresh. Asking for the
+  // disk instead answers "absent", which is what the host's own list() will
+  // say once the close settles.
   //
-  // The materialized-row test is unaffected: it pins what the plugin does
-  // NOT do, and that holds on the real host.
-  const fake = makeFake({ listDelayMs: 300, unwritten: ['s3'] })
+  // A host that does not know the option ignores it and answers from the
+  // tracker, so the row stays there: the conservative bound, unchanged.
+  const fake = makeFake({ listDelayMs: 300 })
   const disposeListeners = withDisposeListener(fake)
   apply(fake.ctx, {})
   await fake.list()
@@ -549,24 +556,26 @@ test('dispose: the plugin removes the row when the host says the session is gone
   assert.equal(rows.length, 3, `the row of the session the host says is gone must be gone (the list served ${rows.length} rows)`)
   assert.equal(rows.some((r) => r?.header?.id === 's3'), false, 's3 must not be served any more')
   assert.deepEqual(fake.service.statCalls, ['s3'], 'the host was asked once, about the disposed session')
+  assert.deepEqual(fake.service.statOptions, [{ source: 'disk' }], 'the host was asked for the durable artifact, not for the tracker')
   assert.ok(elapsed < 150, `the next list() waited ${elapsed} ms for a scan after a dispose`)
   assert.ok(fake.metrics().list.staleServed >= 1, 'the caller was served from memory')
 })
 
-test('dispose: a session the host still knows keeps its row', async () => {
-  // The host answers "still known" (stat resolves a snapshot), so the row is
-  // correct and stays. The host's list() is disk-based and its tracker still
-  // names a detached session, so dropping the row would hide a session the
-  // host still has.
-  const fake = makeFake({ listDelayMs: 300 })
+test('dispose: a session whose artifact still exists keeps its row', async () => {
+  // The host answers "the artifact exists" (stat resolves a snapshot with
+  // sizeBytes), so the row is correct and stays: the host's list() is
+  // disk-based, and a session whose log file is still there is still listed.
+  // Dropping the row would hide a session the host still has.
+  const fake = makeFake({ listDelayMs: 300, materialized: ['s2'] })
   const disposeListeners = withDisposeListener(fake)
   apply(fake.ctx, {})
   await fake.list()
   for (const cb of disposeListeners()) cb({ id: 's2' })
   await settle()
   const rows = await fake.list()
-  assert.equal(rows.length, 4, `a session the host still knows stays in the memo (the list served ${rows.length} rows)`)
+  assert.equal(rows.length, 4, `a session whose artifact exists stays in the memo (the list served ${rows.length} rows)`)
   assert.equal(rows.some((r) => r?.header?.id === 's2'), true, 's2 must still be served')
+  assert.equal(fake.service.statCalls.includes('s2'), false, 'a materialized row is not asked about at all')
 })
 
 test('dispose: a persistence without stat() keeps the row and the listener does not throw', async () => {

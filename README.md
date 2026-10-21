@@ -71,15 +71,15 @@ Yang ditambahkan plugin, semuanya dari `lib/index.js`:
   dibuang. Pemanggil berikutnya dilayani dari memori dalam hitungan milidetik dan
   penyegaran berjalan di belakangnya, sehingga satu peristiwa satu baris tidak lagi
   memaksa memindai ulang direktori penuh. Plugin hanya menanyakan host untuk baris
-  yang belum pernah ditulis ke disk, jadi pertanyaannya yang murah. Pada event
-  dispose, plugin bertanya ke host apakah sesi itu masih terdaftar. Di host ini
-  jawabannya masih "terdaftar" saat itu, karena host menjawab dari tracker
-  in-memory dan baru melepas sesinya setelah handle tulis ditutup; jadi barisnya
-  bertahan sampai penyegaran di belakang selesai, seperti sebelum C1. Baris baru
-  hilang lebih awal kalau host menjawab "tidak terdaftar", dan itu yang terjadi
-  pada host yang menjawab dari disk. Jalur `delete()` juga tidak memberi tahu
-  plugin: `delete()` tidak mempublikasikan `session/disposed`, jadi baris yang
-  dihapus dari store juga bertahan di memo sampai penyegaran berikutnya. Karena
+  yang belum pernah ditulis ke disk, jadi pertanyaannya yang murah. Pada event dispose, plugin bertanya ke host apakah ARTIFAK sesi itu masih ada
+di disk, lewat `stat(id, { source: 'disk' })`. Host yang mendukung opsi itu
+menjawab dari artifact durable, bukan dari tracker in-memory, jadi sesi yang
+dibuang tanpa pernah ditulis langsung hilang dari memo. Host yang mengabaikan
+opsi itu menjawab dari tracker, dan tracker masih memegang sesi sampai handle
+tulis ditutup; di sana barisnya bertahan sampai penyegaran di belakang selesai,
+seperti sebelum C1. Jalur `delete()` juga tidak memberi tahu plugin:
+`delete()` tidak mempublikasikan `session/disposed`, jadi baris yang dihapus dari
+store juga bertahan di memo sampai penyegaran berikutnya. Karena
   itu `disposeRowsRemoved` membaca 0 pada host ini. Itu informasi, bukan
   kegagalan. Batas basi untuk perubahan lain tetap sama dengan jendela stale
   yang sudah dipakai plugin ini.
@@ -439,7 +439,7 @@ pengukuran. Jangan menganggap `13080` sebagai default.
 Plugin memberi dua tanda bahwa ia benar-benar terpasang:
 
 1. Di stderr atau log host, ada baris mount dengan ringkasan konfigurasi
-   (`lib/index.js:817-818`):
+   (`lib/index.js:824-825`):
 
    ```text
    [session-readcache] mounted (mode=list-memo, listTtlMs=750, listMaxStaleMs=30000, snapshotMaxAgeMs=86400000, snapshot=on)
@@ -454,9 +454,9 @@ Plugin memberi dua tanda bahwa ia benar-benar terpasang:
 
 Kalau `ctx.webServer` belum tersedia saat mount, plugin tetap berjalan, mencatat
 `[session-readcache] webServer unavailable at mount; metrics/purge endpoints will
-register when it appears` (`lib/index.js:812`), dan endpoint didaftarkan kemudian
+register when it appears` (`lib/index.js:819`), dan endpoint didaftarkan kemudian
 lewat `ctx.inject(['webServer'], ...)` saat service itu muncul
-(`lib/index.js:799-813`). Bila service itu tidak pernah ada, plugin tetap cache
+(`lib/index.js:806-820`). Bila service itu tidak pernah ada, plugin tetap cache
 tanpa endpoint. Boot tidak pernah diblokir oleh ketiadaan endpoint, dan
 ketiadaan web surface tidak lagi membuat plugin tidak aktif sama sekali: itu
 perilaku lama yang sudah diperbaiki (lihat `lib/index.js:10-19`).
@@ -508,17 +508,17 @@ Arti setiap field:
 | `list.misses` | Scan direktori nyata dijalankan | Termasuk scan yang dipicu refresh di belakang, bukan hanya pemanggil langsung |
 | `list.staleServed` | Dilayani dari jendela stale | Umur memo antara `listTtlMs` dan `listTtlMs + listMaxStaleMs` |
 | `lifecycle.disposedInvalidations` | Memo ditandai basi karena ada sesi dibuang | Event `session/disposed` datang saat memo hangat. Nama field sebelumnya `disposedDrops`: memo tidak lagi dibuang, hanya ditandai basi |
-| `lifecycle.disposeRowsRemoved` | Jumlah dispose yang benar-benar mencabut satu baris dari memo | Baris dicabut kalau host menjawab "tidak terdaftar". Di host ini angkanya 0: pada jalur dispose jawaban host selalu "terdaftar", dan pada jalur delete plugin tidak pernah ditanya. Itu informasi, bukan kegagalan |
+| `lifecycle.disposeRowsRemoved` | Jumlah dispose yang benar-benar mencabut satu baris dari memo | Baris dicabut kalau host menjawab "tidak ada artifact-nya". Di host ini angkanya 0: pada jalur dispose jawaban host selalu "terdaftar", dan pada jalur delete plugin tidak pernah ditanya. Itu informasi, bukan kegagalan |
 | `lifecycle.purgeDrops` | Memo dibuang melalui endpoint purge | POST purge saat memo hangat |
 | `memo.warm` | Memo sedang berisi hasil scan | Setelah satu scan selesai |
 | `memo.ageMs` | Umur memo dalam ms | `null` saat memo kosong |
 | `memo.inflight` | Ada scan yang sedang berjalan | Selama satu scan berlangsung |
 | `snapshot.path` | Lokasi file snapshot, `null` bila dimatikan | Dihitung sekali saat mount |
 | `snapshot.seedResolved` | Seed boot sudah dicoba | Setelah satu pemanggilan `list()`, apa pun hasilnya |
-| `snapshot.seeded` | Memo sedang holds data dari snapshot | True sampai scan nyata berikutnya menggantikannya (`lib/index.js:740`) |
+| `snapshot.seeded` | Memo sedang holds data dari snapshot | True sampai scan nyata berikutnya menggantikannya (`lib/index.js:747`) |
 | `snapshot.saves` | Snapshot yang berhasil ditulis | Setiap penulisan row yang sukses |
 | `snapshot.failures` | Snapshot yang gagal dibaca atau ditulis | Setiap penolakan: rusak, versi skema asing, terlalu besar, terlalu tua, `saved_at` di masa depan, gagal tulis |
-| `snapshot.notes` | Buffer masalah terakhir plugin. Dua jenis teks: alasan persistensi snapshot tidak bekerja, dan baris `dispose: stat failed for <id>: <alasan>` ketika host tidak bisa ditanya apakah sesi yang dibuang masih punya artifact di disk. Bentuk kedua punya dua varian: pesan error aslinya, atau `the answer could not be applied` kalau jawabannya tidak bisa dipakai. Tidak ada catatan untuk host yang memang tidak punya method `stat`, karena itu bukan kegagalan. Nama field-nya historis: isinya bukan cuma soal snapshot | Maksimal 5 catatan terakhir (`lib/index.js:743`). Catatan dispose berarti baris sesi yang dibuang bisa jadi masih basi, jadi operator bisa melihatnya |
+| `snapshot.notes` | Buffer masalah terakhir plugin. Dua jenis teks: alasan persistensi snapshot tidak bekerja, dan baris `dispose: stat failed for <id>: <alasan>` ketika host tidak bisa ditanya apakah sesi yang dibuang masih punya artifact di disk. Bentuk kedua punya dua varian: pesan error aslinya, atau `the answer could not be applied` kalau jawabannya tidak bisa dipakai. Tidak ada catatan untuk host yang memang tidak punya method `stat`, karena itu bukan kegagalan. Nama field-nya historis: isinya bukan cuma soal snapshot | Maksimal 5 catatan terakhir (`lib/index.js:750`). Catatan dispose berarti baris sesi yang dibuang bisa jadi masih basi, jadi operator bisa melihatnya |
 
 Penghitung direset setiap restart, karena mereka hidup di dalam closure `apply()`
 (`lib/index.js:307`) dan bukan di penyimpanan.
@@ -527,7 +527,7 @@ Dua penghitung lifecycle dibaca bersama, bukan sendiri-sendiri.
 `disposedInvalidations` menghitung event `session/disposed` yang datang saat memo
 hangat. `disposeRowsRemoved` menghitung event-event itu yang benar-benar menghapus
 satu baris dari memo. Jadi `disposedInvalidations` besar sementara
-`disposeRowsRemoved` nol berarti host selalu menjawab "terdaftar" saat dispose
+`disposeRowsRemoved` nol berarti host menjawab dari tracker, jadi tidak pernah membuktikan ketiadaan artifact
 datang: barisnya dipertahankan sampai penyegaran di belakang selesai. Angka nol
 di `disposeRowsRemoved` bukan tanda kegagalan, dan bukan tanda plugin tidak
 menjalankan apa-apa.
@@ -542,7 +542,7 @@ curl -X POST 'http://127.0.0.1:13080/plugin/session-readcache/purge?id=s1'
 curl -X POST 'http://127.0.0.1:13080/plugin/session-readcache/purge'
 ```
 
-Bentuk responsnya dari `lib/index.js:713-748`:
+Bentuk responsnya dari `lib/index.js:720-755`:
 
 ```json
 { "purged": 1 }
@@ -551,7 +551,7 @@ Bentuk responsnya dari `lib/index.js:713-748`:
 Perilaku yang perlu diketahui:
 
 - Metode selain `POST` ditolak dengan status 405 dan badan
-  `{ "error": "method not allowed; use POST" }` (`lib/index.js:753-756`).
+  `{ "error": "method not allowed; use POST" }` (`lib/index.js:760-763`).
 - Dengan `?id=`, entri itu dihapus dari cache dan dari daftar in-flight.
   `purged: 1` kalau ditemukan, `0` kalau tidak.
 - Tanpa `id`, memo `list` dikosongkan, dan `purged` bernilai `1` kalau memo
@@ -1049,10 +1049,10 @@ Penyebab yang mungkin, urut dari yang paling mungkin:
 
 Gejala: baris mount ada, tapi `curl .../metrics` tidak menjawab.
 
-Kode menebak-nebak apa yang terjadi: `lib/index.js:808-816` hanya menulis
+Kode menebak-nebak apa yang terjadi: `lib/index.js:815-823` hanya menulis
 peringatan ketika `ctx.webServer === undefined`. Kalau `ctx.webServer` ada tapi
 `register` gagal, pesannya berbeda: `[session-readcache] route registration failed:
-<pesan>` (`lib/index.js:792`, `805`).
+<pesan>` (`lib/index.js:799`, `805`).
 
 Periksa:
 
@@ -1073,7 +1073,7 @@ Gejala:
 ```
 
 Penyebab: purge mengubah state, jadi `GET` sengaja ditolak untuk mencegah
-penghapusan cache yang tidak disengaja (`lib/index.js:747-751`).
+penghapusan cache yang tidak disengaja (`lib/index.js:754-758`).
 
 Perbaikan: pakai `POST`.
 
@@ -1184,8 +1184,8 @@ Empat sebab yang mungkin, dan cara membedakannya:
 
 | Yang terlihat | Kenapa | Yang harus dilakukan |
 | --- | --- | --- |
-| `lifecycle.disposedInvalidations` naik, `lifecycle.disposeRowsRemoved` tetap nol | Pada event dispose, host menjawab "terdaftar", jadi baris dipertahankan dan bertahan sampai penyegaran di belakang selesai | Tidak ada. Baris itu hilang sendiri saat penyegaran selesai |
-| `snapshot.notes` berisi `dispose: stat failed for <id>: <alasan>` | Host tidak bisa ditanya apakah sesinya masih terdaftar, jadi baris dipertahankan: jawaban "tidak terdaftar" belum terbukti | Baca alasannya. Baris itu tetap dilayani sampai penyegaran di belakang selesai |
+| `lifecycle.disposedInvalidations` naik, `lifecycle.disposeRowsRemoved` tetap nol | Pada event dispose, host menjawab dari tracker, jadi tidak ada artifact yang terbukti hilang, jadi baris dipertahankan dan bertahan sampai penyegaran di belakang selesai | Tidak ada. Baris itu hilang sendiri saat penyegaran selesai |
+| `snapshot.notes` berisi `dispose: stat failed for <id>: <alasan>` | Host tidak bisa ditanya apakah artifact sesinya masih ada, jadi baris dipertahankan: jawaban "tidak terdaftar" belum terbukti | Baca alasannya. Baris itu tetap dilayani sampai penyegaran di belakang selesai |
 | Log sesainya dihapus dari disk, tapi barisnya tetap ada | Log dihapus lewat jalur lain, bukan lewat dispose. API `delete()` milik host tidak memancarkan `session/disposed`, jadi plugin tidak diberi tahu | Tunggu penyegaran di belakang selesai. Endpoint purge memaksa scan ulang, dengan harga scan penuh 12,9 detik di host ini (bagian 7.4) |
 
 Kalau `snapshot.notes` tidak menunjukkan apa-apa dan `disposeRowsRemoved` tetap
@@ -1212,7 +1212,7 @@ Ada lima kontrak yang disebut berulang kali di `lib/index.js` dan di
 | Cache bersifat advisory | Setiap kegagalan di lapisan cache harus jatuh ke method asli | `try/catch` di sekeliling pemakaian memo dan penulisan snapshot |
 | Set faithfully pada pembatalan | Pemanggil yang SUDAH dibatalkan tidak pernah dilayani dari memo dan tidak dihitung (host tidak memindai apa pun); pemanggil yang membawa signal HIDUP dilayani dari memo, karena membatalkan scan tidak membuat balasan dari memori jadi basi. Argumen pertama host adalah OPTIONS BAG `{signal?}`, bukan signal-nya sendiri (`SessionPersistenceListOptions`) | `lib/index.js`, fungsi `list(options)` + `isAbortSignalLike` |
 | Bungkus hanya baca | Method tulis, `load`, `prepare`, dan perbaikan tidak dibungkus | Hanya `list` yang di-`defineProperty`, dan hanya kalau method itu ada |
-| Invalidasi lifecycle | Sesi yang dibuang membuat memo basi, bukan membuahkannya: pemanggil berikutnya dilayani dari memori dan penyegaran berjalan di belakang. Plugin bertanya ke host apakah sesi itu masih terdaftar, dan mencabut baris itu kalau host menjawab sesi sudah tidak ada. Baris yang sudah punya artifact dipertahankan tanpa menanyakan host, karena `list()` milik host masih menyebut sesi itu | Listener `session/disposed` di `lib/index.js`: menandai memo basi (`listDirty`), lalu untuk baris yang belum pernah ditulis ke disk memanggil `target.stat(id)` pada service `sessionPersistence` yang sama (helper `invalidateDisposedRow`, pemeriksa `isMaterialized`) |
+| Invalidasi lifecycle | Sesi yang dibuang membuat memo basi, bukan membuahkannya: pemanggil berikutnya dilayani dari memori dan penyegaran berjalan di belakang. Plugin lalu bertanya ke host apakah artifact sesi itu masih ada di disk, dan mencabut barisnya kalau jawabannya tidak. Plugin bertanya ke host apakah sesi itu masih terdaftar, dan mencabut baris itu kalau host menjawab sesi sudah tidak ada. Baris yang sudah punya artifact dipertahankan tanpa menanyakan host, karena `list()` milik host masih menyebut sesi itu | Listener `session/disposed` di `lib/index.js`: menandai memo basi (`listDirty`), lalu untuk baris yang belum pernah ditulis ke disk memanggil `target.stat(id)` pada service `sessionPersistence` yang sama (helper `invalidateDisposedRow`, pemeriksa `isMaterialized`) |
 | Mount tidak boleh mati diam-diam | Kalau method yang akan dibungkus tidak ada, plugin tetap mount, tetap memasang route, dan melaporkan mode `inert` | `mode` di banner dan metrics |
 
 Kontrak invalidasi lifecycle punya satu tambahan dari hardening 2026-10-09.
@@ -1233,7 +1233,7 @@ baris itu, dan hanya kalau sesinya belum pernah ditulis ke disk.
 
 Yang dilakukan jalur `list()` sekarang, per kontrak C1 di
 `docs/CONTRACT-c1-dispose.md` (disepakati 2026-10-21): `session/disposed`
-menandai memo basi, lalu plugin menanyakan host apakah sesi itu masih terdaftar.
+menandai memo basi, lalu plugin menanyakan host apakah artifact sesi itu masih ada di disk.
 Baris yang sudah punya artifact di disk, yaitu baris snapshot host yang membawa
 `sizeBytes`, TIDAK ditanyakan ke host dan dipertahankan apa adanya. Itu bukan
 shortcut: dispose hanya melepaskan sesi, bukan menghapus lognya, jadi artifact
@@ -1260,14 +1260,15 @@ log generasi lama menghash seluruh korpus, dengan median 1,96 detik di host ini
 (bagian 7.4), tapi baris seperti itu tidak pernah ditanyakan, karena baris itu
 selalu punya artifact. Kelas mahal itu hilang dari jalur dispose.
 
-Pada event dispose, plugin bertanya ke host apakah sesi itu masih terdaftar. Di
-host ini jawabannya masih "terdaftar" saat itu, karena host menjawab dari tracker
-in-memory dan baru melepas sesinya setelah handle tulis ditutup; jadi barisnya
-bertahan sampai penyegaran di belakang selesai, seperti sebelum C1. Baris baru
-hilang lebih awal kalau host menjawab "tidak terdaftar", dan itu yang terjadi
-pada host yang menjawab dari disk. Jalur `delete()` juga tidak memberi tahu
-plugin: `delete()` tidak mempublikasikan `session/disposed`, jadi baris yang
-dihapus dari store juga bertahan di memo sampai penyegaran berikutnya. Karena
+Pada event dispose, plugin bertanya ke host apakah ARTIFAK sesi itu masih ada
+di disk, lewat `stat(id, { source: 'disk' })`. Host yang mendukung opsi itu
+menjawab dari artifact durable, bukan dari tracker in-memory, jadi sesi yang
+dibuang tanpa pernah ditulis langsung hilang dari memo. Host yang mengabaikan
+opsi itu menjawab dari tracker, dan tracker masih memegang sesi sampai handle
+tulis ditutup; di sana barisnya bertahan sampai penyegaran di belakang selesai,
+seperti sebelum C1. Jalur `delete()` juga tidak memberi tahu plugin:
+`delete()` tidak mempublikasikan `session/disposed`, jadi baris yang dihapus dari
+store juga bertahan di memo sampai penyegaran berikutnya. Karena
 itu `disposeRowsRemoved` membaca 0 pada host ini. Itu informasi, bukan kegagalan.
 
 Jawaban `stat()` datang asynchronous, dan memo tidak pernah dibuang selama
@@ -1324,7 +1325,7 @@ LANGKAH-langkahnya mengikuti pola yang sudah ada:
 2. Baca lewat `readCount` di `lib/index.js:56-62` (menggantikan pakaian
    `positiveInt`/`nonNegativeInt` yang hanya diam-diam jatuh ke default). Daftar
    kunci beserta aturan boleh-nol-nya ada di `countSpecs`, `lib/index.js:289-293`.
-3. Tulis ke ringkasan mount di `lib/index.js:817` supaya nilai efektif terlihat
+3. Tulis ke ringkasan mount di `lib/index.js:824` supaya nilai efektif terlihat
    di log saat boot, dan pastikan nilai tidak valid memicu peringatan
    (`lib/index.js:297`) bukan diam-diam diganti.
 4. Tulis ulang nilai yang sama di `cordis.patch.yml` supaya terlihat di konfigurasi.
@@ -1457,8 +1458,8 @@ penting untuk diketahui:
   mengizinkan.
 - Purge menolak semua metode selain POST dengan 405.
 - Kedua route didaftarkan di dalam guard `ctx.inject`, supaya pemasangan ganda
-  tidak menabrak error path ganda dari web server (`lib/index.js:709`, `319`).
-- Kedua route dilepas saat plugin dilepas (`lib/index.js:820-829`).
+  tidak menabrak error path ganda dari web server (`lib/index.js:716`, `319`).
+- Kedua route dilepas saat plugin dilepas (`lib/index.js:827-836`).
 
 Perhatikan konsekuensinya: kalau web server host Anda terbuka ke jaringan tanpa
 autentikasi, endpoint purge bisa dihapus dari cache oleh siapa pun yang bisa
@@ -1491,8 +1492,8 @@ basi setelah seed dari snapshot saat boot. Dengan default yang dikirim, batas
 terburuk itu 24 jam + 750 ms + 30 detik. `session/disposed` tidak lagi membuang
 memo, dan baris sesi yang dibuang bertahan di memo sampai penyegaran di
 belakang selesai, seperti sebelum C1: pada event dispose, host masih menjawab
-"terdaftar" karena menjawab dari tracker in-memory. Baris hilang lebih awal kalau
-host menjawab "tidak terdaftar", dan itu yang terjadi pada host yang menjawab
+"tidak ada artifact-nya" karena menjawab dari tracker in-memory. Baris hilang lebih awal kalau
+host menjawab "tidak ada artifact-nya", dan itu yang terjadi pada host yang menjawab
 dari disk. Batas basi untuk sisa isi memo tetap jendela stale itu juga. Sesi
 yang sedang aktif tidak pernah disentuh.
 
@@ -1627,7 +1628,7 @@ Bukan bagian untuk pembaca umum.
 - Port `13080`, dari URL yang dicetak host hidup saat boot
   (`dsh web: http://127.0.0.1:13080/...`). Hostlah yang memilih portnya; repo ini
   hanya memakai apa yang dicetak host.
-- Path endpoint metrics dan purge, dari `lib/index.js:713` dan `750`.
+- Path endpoint metrics dan purge, dari `lib/index.js:720` dan `750`.
 - Jumlah test 37, dengan cara hit yang dinyatakan di bagian 10.3.
 
 **Inferred**, ditulis dengan label eksplisit:

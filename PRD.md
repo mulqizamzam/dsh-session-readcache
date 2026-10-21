@@ -78,7 +78,7 @@ Empat mekanisme, semuanya di `lib/index.js`:
 | FR-13 | Konfigurasi di luar domain jatuh ke default dan nama kuncinya disebut di log mount | `config: invalid values fall back to defaults and the route reports them` |
 | FR-14 | `enabled: false` mematikan plugin tanpa meninggalkan route | `mount: disabled by config leaves no routes` |
 | FR-15 | Service tanpa `list()` tetap mount dalam mode `inert` dan tetap melaporkan metrik | `mount: a persistence without list() mounts inert but still exposes metrics` |
-| FR-16 | Pada `session/disposed`, plugin bertanya ke host apakah sesi itu masih terdaftar, dan mencabut baris itu kalau host menjawab sesi sudah tidak ada. Baris yang sudah punya artifact dipertahankan tanpa menanyakan host, dan `stat` yang menolak juga mempertahankan baris | `dispose: the plugin removes the row when the host says the session is gone, and the caller is served from memory`, `dispose: a session the host still knows keeps its row`, `dispose: a materialized row is kept without asking the host`, `dispose: a stat() that rejects keeps the row and never rejects out of the listener`, `dispose: a persistence without stat() keeps the row and the listener does not throw` |
+| FR-16 | Pada `session/disposed`, plugin bertanya ke host apakah artifact sesi itu masih ada di disk, dan mencabut baris itu kalau host menjawab tidak ada artifact-nya. Baris yang sudah punya artifact dipertahankan tanpa menanyakan host, dan `stat` yang menolak juga mempertahankan baris | `dispose: the plugin removes the row when the host says the session is gone, and the caller is served from memory`, `dispose: a session the host still knows keeps its row`, `dispose: a materialized row is kept without asking the host`, `dispose: a stat() that rejects keeps the row and never rejects out of the listener`, `dispose: a persistence without stat() keeps the row and the listener does not throw` |
 
 ## 5. Persyaratan non-fungsional
 
@@ -100,7 +100,7 @@ Kesegaran adalah trade-off yang disengaja, jadi batasnya ditulis eksplisit:
 | --- | --- |
 | Setelah scan nyata terakhir | `listMaxStaleMs` (30 detik dengan default) |
 | Setelah seed dari snapshot saat boot | `snapshotMaxAgeMs + listTtlMs + listMaxStaleMs` (24 jam + 750 ms + 30 detik dengan default). Terukur: seed ditolak saat restart dengan jendela 10 menit karena snapshot berumur 56 menit; jendela dinaikkan ke 24 jam |
-| Setelah `session/disposed`, untuk baris sesi yang dibuang | Sampai penyegaran di belakang selesai, sama seperti sebelum C1, karena pada event dispose host masih menjawab "terdaftar". Baris hilang lebih awal kalau host menjawab "tidak terdaftar", dan itu yang terjadi pada host yang menjawab dari disk |
+| Setelah `session/disposed`, untuk baris sesi yang dibuang | Sampai penyegaran di belakang selesai pada host yang menjawab dari tracker, sama seperti sebelum C1, karena pada event dispose tracker masih memegang sesinya. Baris hilang lebih awal kalau host menjawab "tidak ada artifact-nya", dan itu yang terjadi pada host yang menjawab dari disk |
 | Setelah `session/disposed`, untuk sisa isi memo | `listMaxStaleMs` (30 detik dengan default), sampai penyegaran di belakang selesai |
 
 `session/disposed` tidak lagi membuang memo; memo ditandai basi. Plugin hanya
@@ -113,19 +113,20 @@ Yang berubah sejak host `0.2.0-rc.2` menghapus `inspect`: jalur `list()` hanya
 mengembalikan header sesi, dan header (`id`, `createdAt`, `cwd`, `version`,
 `isSeeded`) tidak berubah saat flush terakhir mendarat.
 
-Pada event dispose, plugin bertanya ke host apakah sesi itu masih terdaftar. Di
-host ini jawabannya masih "terdaftar" saat itu, karena host menjawab dari tracker
-in-memory dan baru melepas sesinya setelah handle tulis ditutup; jadi barisnya
-bertahan sampai penyegaran di belakang selesai, seperti sebelum C1. Baris baru
-hilang lebih awal kalau host menjawab "tidak terdaftar", dan itu yang terjadi
-pada host yang menjawab dari disk. Jalur `delete()` juga tidak memberi tahu
-plugin: `delete()` tidak mempublikasikan `session/disposed`, jadi baris yang
-dihapus dari store juga bertahan di memo sampai penyegaran berikutnya. Karena
+Pada event dispose, plugin bertanya ke host apakah ARTIFAK sesi itu masih ada
+di disk, lewat `stat(id, { source: 'disk' })`. Host yang mendukung opsi itu
+menjawab dari artifact durable, bukan dari tracker in-memory, jadi sesi yang
+dibuang tanpa pernah ditulis langsung hilang dari memo. Host yang mengabaikan
+opsi itu menjawab dari tracker, dan tracker masih memegang sesi sampai handle
+tulis ditutup; di sana barisnya bertahan sampai penyegaran di belakang selesai,
+seperti sebelum C1. Jalur `delete()` juga tidak memberi tahu plugin:
+`delete()` tidak mempublikasikan `session/disposed`, jadi baris yang dihapus dari
+store juga bertahan di memo sampai penyegaran berikutnya. Karena
 itu `disposeRowsRemoved` membaca 0 pada host ini. Itu informasi, bukan kegagalan.
 
 Jawaban `stat()` datang asynchronous, dan memo tidak pernah dibuang selama
 jawabannya belum tiba. Kalau `stat` menolak atau `target.stat` bukan fungsi,
-baris dipertahankan karena jawaban "tidak terdaftar" belum terbukti; baris itu
+baris dipertahankan karena jawaban "tidak ada artifact-nya" belum terbukti; baris itu
 hilang saat penyegaran di belakang selesai, dan penyegaran itu sudah dijadwalkan
 oleh dispose yang sama.
 
@@ -194,8 +195,8 @@ terakhir bukan perintah yang bisa dijalankan dari repo yang dikloning.
    `lifecycle.disposedInvalidations`, karena memo tidak lagi dibuang. Key ketiga,
    `lifecycle.disposeRowsRemoved`, ditambahkan 2026-10-21: ia menghitung
    dispose yang benar-benar mencabut satu baris dari memo. Di host ini
-   `disposeRowsRemoved` membaca 0, karena pada jalur dispose jawaban host selalu
-   "terdaftar"; angka nol itu informasi, bukan kegagalan. Kalau ada konsumen luar endpoint metrik, kunci lama bisa
+   `disposeRowsRemoved` membaca 0 pada host yang menjawab dari tracker; angka nol
+   itu informasi, bukan kegagalan. Kalau ada konsumen luar endpoint metrik, kunci lama bisa
    dikembalikan sebagai alias satu rilis.
 2. **Opsi inert. SUDAH DIPUTUSKAN 2026-10-21: C1, dihapus.** `maxEntries` dan
    `maxTotalEvents` tidak lagi melakukan apa-apa sejak 2026-10-10 (sisa cache
@@ -239,15 +240,15 @@ terakhir bukan perintah yang bisa dijalankan dari repo yang dikloning.
    jawabannya belum tiba. Sisa memo tetap basi sampai `listMaxStaleMs` (30 detik
    dengan default), dan pemanggil berikutnya dilayani dari memori sementara
    penyegaran berjalan di belakang.
-   Pada event dispose, plugin bertanya ke host apakah sesi itu masih terdaftar.
-   Di host ini jawabannya masih "terdaftar" saat itu, karena host menjawab dari
-   tracker in-memory dan baru melepas sesinya setelah handle tulis ditutup; jadi
-   barisnya bertahan sampai penyegaran di belakang selesai, seperti sebelum C1.
-   Baris baru hilang lebih awal kalau host menjawab "tidak terdaftar", dan itu
-   yang terjadi pada host yang menjawab dari disk. Jalur `delete()` juga tidak
-   memberi tahu plugin: `delete()` tidak mempublikasikan `session/disposed`, jadi
-   baris yang dihapus dari store juga bertahan di memo sampai penyegaran
-   berikutnya. Karena itu `disposeRowsRemoved` membaca 0 pada host ini. Itu
+   Pada event dispose, plugin bertanya ke host apakah ARTIFAK sesi itu masih ada
+di disk, lewat `stat(id, { source: 'disk' })`. Host yang mendukung opsi itu
+menjawab dari artifact durable, bukan dari tracker in-memory, jadi sesi yang
+dibuang tanpa pernah ditulis langsung hilang dari memo. Host yang mengabaikan
+opsi itu menjawab dari tracker, dan tracker masih memegang sesi sampai handle
+tulis ditutup; di sana barisnya bertahan sampai penyegaran di belakang selesai,
+seperti sebelum C1. Jalur `delete()` juga tidak memberi tahu plugin:
+`delete()` tidak mempublikasikan `session/disposed`, jadi baris yang dihapus dari
+store juga bertahan di memo sampai penyegaran berikutnya. Karena itu `disposeRowsRemoved` membaca 0 pada host ini. Itu
    informasi, bukan kegagalan.
    Trade-off yang dicatat: jalur event kini memanggil satu method host lagi,
    jadi plugin bergantung pada `SessionPersistence.stat` yang ada di interface
