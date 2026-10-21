@@ -3,8 +3,10 @@
 **Status:** Selesai di sisi host 2026-10-21, commit `1b1b35b31d` pada
 `/home/administrator/deepseek-harness`: `SessionPersistenceStatOptions` gaining
 `source?: 'tracked' | 'disk'`, dan backend jsonl yang melewati tracker kalau
-opsinya `'disk'`. Build dan restart host belum dijalankan; perubahan belum
-terpasang di host yang sedang hidup.
+opsinya `'disk'`. Spec `packages/session/session-persistence-jsonl/tests/stat-disk-source.spec.ts`
+lolos 3/3 (`vitest run`), dan typecheck repo lolos saat push. Build sudah
+terjalan lewat pre-push hook, jadi `lib/` host sudah memuat perubahan ini; host
+yang sedang hidup masih memakai build lamanya dan butuh restart.
 **Dialokasikan oleh:** plugin `dsh-session-readcache`.
 **Tanggal penulisan:** 2026-10-21, oleh agen (investigasi terukur, bukan eksekusi).
 
