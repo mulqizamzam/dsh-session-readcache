@@ -7,11 +7,11 @@
     - id: session-readcache
       name: dsh-session-readcache
       config:
-        listTtlMs: 750
+        listTtlMs: 5000
         # A real list() scan measures ~9.7s for 3.8k logs here, so a strict TTL
         # expires before any caller can be served. Inside this window the last
         # scan is returned immediately while a refresh runs behind it.
-        listMaxStaleMs: 30000
+        listMaxStaleMs: 120000
         # Boot seeding: reuse the persisted snapshot if it is younger than this.
         # 24 h, not 10 min: the row is only rewritten after a scan, so a restart
         # after an idle hour lands outside a 10 min window. Measured 2026-10-21:
