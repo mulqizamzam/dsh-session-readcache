@@ -525,6 +525,18 @@ function withDisposeListener(fake) {
   return () => listeners.get('session/disposed') ?? []
 }
 
+/**
+ * Same idea as withDisposeListener, but hands back a getter for the callbacks of
+ * ANY event name. The counter tests need `session/created`, and they also assert
+ * that the plugin registered exactly one listener for it, so the map is both the
+ * trigger and the evidence.
+ */
+function withEventListeners(fake) {
+  const listeners = new Map()
+  fake.ctx.on = (event, cb) => { const l = listeners.get(event) ?? []; l.push(cb); listeners.set(event, l) }
+  return (event) => listeners.get(event) ?? []
+}
+
 test('dispose: the plugin removes the row when the host says the session is gone, and the caller is served from memory', async () => {
   // WHAT THIS PINS. The plugin asks the host for the DURABLE artifact
   // (stat with source 'disk'), not for "does this process still track it".
@@ -797,6 +809,64 @@ test('lifecycle: a created session must not wait out the TTL', async () => {
   assert.ok(
     ids(second).includes('s2'),
     `the first list() after session/created must include s2 (got ${JSON.stringify(ids(second))}; host scans: ${scans})`,
+  )
+})
+
+// --- createdInvalidations counter ---------------------------------------------
+
+test('metrics: createdInvalidations moves when a warm memo is dropped', async () => {
+  // WHAT THIS PINS. The counter is only meaningful if it reports the case it
+  // was added for: a warm memo that a creation makes WRONG. Dropping a cold
+  // memo costs nothing (there is no caller to mislead yet), so the handler
+  // must not count that. Exactly one event, exactly one increment.
+  const fake = makeFake()
+  const forEvent = withEventListeners(fake)
+  apply(fake.ctx, { listTtlMs: 5000, listMaxStaleMs: 120000 })
+
+  // Warm the memo. Without this the cache is cold and the handler must not count.
+  await fake.list()
+  assert.equal(
+    fake.metrics().lifecycle.createdInvalidations,
+    0,
+    'no creation has happened yet, so the counter must start at zero',
+  )
+
+  const created = forEvent('session/created')
+  assert.equal(created.length, 1, 'the plugin must register exactly one session/created listener')
+  for (const cb of created) cb({ id: 's5' })
+
+  assert.equal(
+    fake.metrics().lifecycle.createdInvalidations,
+    1,
+    'one creation against a warm memo must move the counter by exactly one',
+  )
+})
+
+test('metrics: createdInvalidations stays zero when the memo is cold', async () => {
+  // The other half of the same contract: with no memo there is nothing to
+  // invalidate, so a creation is free. A counter that moved here would report
+  // cost that no caller ever paid.
+  const fake = makeFake()
+  const forEvent = withEventListeners(fake)
+  apply(fake.ctx, { listTtlMs: 5000, listMaxStaleMs: 120000 })
+
+  // NO fake.list() call: the memo is cold on purpose.
+  const created = forEvent('session/created')
+  assert.equal(created.length, 1, 'the plugin must register exactly one session/created listener')
+  for (const cb of created) cb({ id: 's5' })
+
+  assert.equal(
+    fake.metrics().lifecycle.createdInvalidations,
+    0,
+    'a creation with no warm memo has nothing to drop, so the counter must stay zero',
+  )
+
+  // The scan that follows must not retroactively count it either.
+  await fake.list()
+  assert.equal(
+    fake.metrics().lifecycle.createdInvalidations,
+    0,
+    'the scan after the creation must not move the counter',
   )
 })
 
