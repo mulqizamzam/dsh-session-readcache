@@ -486,7 +486,7 @@ Bentuk responsnya diambil dari handler di `lib/index.js`:
 {
   "mode": "list-memo",
   "list": { "hits": 0, "misses": 0, "staleServed": 0 },
-  "lifecycle": { "disposedInvalidations": 0, "disposeRowsRemoved": 0, "purgeDrops": 0 },
+  "lifecycle": { "disposedInvalidations": 0, "createdInvalidations": 0, "disposeRowsRemoved": 0, "purgeDrops": 0 },
   "memo": { "warm": false, "ageMs": null, "inflight": false },
   "config": { "listTtlMs": 750, "listMaxStaleMs": 30000, "snapshotMaxAgeMs": 86400000 },
   "snapshot": { "path": null, "seedResolved": false, "seeded": false, "saves": 0, "failures": 0, "notes": [] }
@@ -508,6 +508,7 @@ Arti setiap field:
 | `list.misses` | Scan direktori nyata dijalankan | Termasuk scan yang dipicu refresh di belakang, bukan hanya pemanggil langsung |
 | `list.staleServed` | Dilayani dari jendela stale | Umur memo antara `listTtlMs` dan `listTtlMs + listMaxStaleMs` |
 | `lifecycle.disposedInvalidations` | Memo ditandai basi karena ada sesi dibuang | Event `session/disposed` datang saat memo hangat. Nama field sebelumnya `disposedDrops`: memo tidak lagi dibuang, hanya ditandai basi |
+| `lifecycle.createdInvalidations` | Memo **dibuang** karena ada sesi baru dibuat | Event `session/created` datang saat memo hangat. Berbeda dari dispose: memo tidak bisa sekadar ditandai basi, karena jalur stale akan menyajikan array lama sekali lagi dan array itu tidak mungkin memuat sesi baru. Angka nol berarti setiap pembuatan terjadi saat memo dingin, jadi tidak ada pemanggil yang dirugikan |
 | `lifecycle.disposeRowsRemoved` | Jumlah dispose yang benar-benar mencabut satu baris dari memo | Baris dicabut kalau host menjawab "tidak ada artifact-nya". Di host ini angkanya 0: pada jalur dispose jawaban host selalu "terdaftar", dan pada jalur delete plugin tidak pernah ditanya. Itu informasi, bukan kegagalan |
 | `lifecycle.purgeDrops` | Memo dibuang melalui endpoint purge | POST purge saat memo hangat |
 | `memo.warm` | Memo sedang berisi hasil scan | Setelah satu scan selesai |
@@ -531,6 +532,16 @@ satu baris dari memo. Jadi `disposedInvalidations` besar sementara
 datang: barisnya dipertahankan sampai penyegaran di belakang selesai. Angka nol
 di `disposeRowsRemoved` bukan tanda kegagalan, dan bukan tanda plugin tidak
 menjalankan apa-apa.
+
+`createdInvalidations` adalah pasangan yang berlawanan arah: ia bergerak saat
+sesi baru **masuk**, bukan saat sesi lama keluar. Dispose cukup menandai memo
+basi karena baris yang dibuang tetap benar untuk pemanggil berikutnya sampai
+penyegaran selesai; pembuatan tidak punya kemewahan itu — array lama secara
+logis tidak memuat sesi baru, jadi memo harus dibuang, dan pemanggil berikutnya
+membayar satu pemindaian. Karena itu angkanya hanya naik saat memo sedang
+hangat; pembuatan dengan memo dingin tidak merugikan siapa pun dan tidak
+dihitung. Bandingkan `purgeDrops`: itu juga menghitung memo yang dibuang, tetapi
+lewat endpoint purge, bukan lewat event host.
 
 ### 7.2 Bersihkan cache satu sesi atau semuanya
 

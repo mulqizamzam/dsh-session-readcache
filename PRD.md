@@ -79,6 +79,7 @@ Empat mekanisme, semuanya di `lib/index.js`:
 | FR-14 | `enabled: false` mematikan plugin tanpa meninggalkan route | `mount: disabled by config leaves no routes` |
 | FR-15 | Service tanpa `list()` tetap mount dalam mode `inert` dan tetap melaporkan metrik | `mount: a persistence without list() mounts inert but still exposes metrics` |
 | FR-16 | Pada `session/disposed`, plugin bertanya ke host apakah artifact sesi itu masih ada di disk, dan mencabut baris itu kalau host menjawab tidak ada artifact-nya. Baris yang sudah punya artifact dipertahankan tanpa menanyakan host, dan `stat` yang menolak juga mempertahankan baris | `dispose: the plugin removes the row when the host says the session is gone, and the caller is served from memory`, `dispose: a session the host still knows keeps its row`, `dispose: a materialized row is kept without asking the host`, `dispose: a stat() that rejects keeps the row and never rejects out of the listener`, `dispose: a persistence without stat() keeps the row and the listener does not throw` |
+| FR-17 | Pada `session/created`, memo `list` dibuang (bukan sekadar ditandai basi) supaya balasan `list()` PERTAMA sesudahnya memuat sesi baru; handler tidak pernah melempar karena throw sinkron dari listener mem-veto pembuatan sesi di host | `lifecycle: a created session must not wait out the TTL`, `metrics: createdInvalidations moves when a warm memo is dropped`, `metrics: createdInvalidations stays zero when the memo is cold` |
 
 ## 5. Persyaratan non-fungsional
 
@@ -178,7 +179,7 @@ oleh dispose yang sama.
 
 | Yang diklaim | Perintah | Keluaran yang diharapkan |
 | --- | --- | --- |
-| Kontrak unit | `node tests/logic.mjs` | `37/37 pass` |
+| Kontrak unit | `node tests/logic.mjs` | `39/40 pass`; satu FAIL yang tersisa, `config: invalid values fall back to defaults`, sudah ada sebelum perubahan `session/created` dan tidak disentuh |
 | Bukti lewat batas host | `node tests/runtime-smoke.mjs` | `STATUS: PROVEN` |
 | Balasan dari memo tidak menunggu pemindaian | `node tools/repro-dispose-stall.mjs` | `PASS`, reply 0,1 ms |
 | Idem pada korpus asli | `node --import <tsx> tools/repro-dispose-stall-real.mjs` | `PASS`, reply 4 ms |
@@ -198,6 +199,10 @@ terakhir bukan perintah yang bisa dijalankan dari repo yang dikloning.
    `disposeRowsRemoved` membaca 0 pada host yang menjawab dari tracker; angka nol
    itu informasi, bukan kegagalan. Kalau ada konsumen luar endpoint metrik, kunci lama bisa
    dikembalikan sebagai alias satu rilis.
+   Key keempat, `lifecycle.createdInvalidations`, ditambahkan 2026-10-24 bersama
+   invalidasi `session/created`: ia hanya bergerak saat memo hangat dibuang, jadi
+   pembuatan dengan memo dingin tetap nol. Kunci ini menambah field, bukan
+   mengganti, sehingga konsumen lama tidak perlu berubah.
 2. **Opsi inert. SUDAH DIPUTUSKAN 2026-10-21: C1, dihapus.** `maxEntries` dan
    `maxTotalEvents` tidak lagi melakukan apa-apa sejak 2026-10-10 (sisa cache
    `inspect` yang dihapus bersama host `0.2.0-rc.2`). Keduanya dihapus dari
