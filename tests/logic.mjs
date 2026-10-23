@@ -747,6 +747,59 @@ test('config: explicit zero TTL with zero stale window rescans every call', asyn
   assert.equal(fake.service.listCalls, 2)
 })
 
+test('lifecycle: a created session must not wait out the TTL', async () => {
+  // WHAT THIS PINS. The memo is a WHOLE-LIST snapshot, and until this test it
+  // was invalidated only on the way OUT of a session (`session/disposed`). A
+  // session that is CREATED must show up on the very next list(): the host
+  // already lists created-but-unmaterialized sessions (see `list()` in
+  // session-persistence-jsonl), so a memo computed before the creation is
+  // simply wrong, not merely old.
+  //
+  // WHY THE ASSERTION IS ON THE FIRST REPLY. Marking the memo dirty is NOT
+  // enough: the stale-serve path hands back the pre-change array once and
+  // refreshes behind the caller, so a test that only waits for a background
+  // scan would pass for the wrong reason. This fake has no delay, so a
+  // dirty-only fix would still answer the first call from the old array.
+  const state = {
+    snapshots: [{ header: { id: 's1', cwd: '/p1', createdAt: 1 }, revision: 'r-s1', eventCount: 1, sizeBytes: 4096 }],
+  }
+  let scans = 0
+  const service = {
+    get listCalls() { return scans },
+    async list() {
+      scans += 1
+      return state.snapshots.map((s) => ({ ...s, header: { ...s.header } }))
+    },
+  }
+  const listeners = new Map()
+  const routes = []
+  const ctx = {
+    inject: (names, cb) => cb({ sessionPersistence: service, sessions: { get: () => undefined } }),
+    effect: (fn) => fn(),
+    logger: { info: () => {}, warn: () => {} },
+    // The host's ctx.on(); the plugin may or may not have registered a
+    // 'session/created' listener at HEAD, so this map is the evidence.
+    on: (event, cb) => { const l = listeners.get(event) ?? []; l.push(cb); listeners.set(event, l) },
+    webServer: { register(route) { routes.push(route); return () => {} } },
+  }
+  apply(ctx, { listTtlMs: 5000, listMaxStaleMs: 120000 })
+
+  const ids = (rows) => rows.map((r) => r?.header?.id)
+  const first = await service.list()
+  assert.deepEqual(ids(first), ['s1'], 'the baseline scan must name only s1')
+
+  // The host creates s2 and publishes `session/created`, as sessions.create()
+  // does. After this point list() would name s2 as well.
+  state.snapshots.push({ header: { id: 's2', cwd: '/p1', createdAt: 2 }, revision: 'r-s2', eventCount: 0 })
+  for (const cb of listeners.get('session/created') ?? []) cb({ id: 's2' })
+
+  const second = await service.list()
+  assert.ok(
+    ids(second).includes('s2'),
+    `the first list() after session/created must include s2 (got ${JSON.stringify(ids(second))}; host scans: ${scans})`,
+  )
+})
+
 let failed = 0
 for (const [label, fn] of tests) {
   try {
