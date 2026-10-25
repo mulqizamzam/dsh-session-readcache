@@ -870,6 +870,159 @@ test('metrics: createdInvalidations stays zero when the memo is cold', async () 
   )
 })
 
+// --- copy() edge cases -------------------------------------------------------
+
+test('copy: non-array input returns as-is without throwing', async () => {
+  // Regression: a misbehaving host returning null/undefined must not crash the wrapper.
+  // makeFake captures service.list in a closure, so we construct with custom params instead.
+  const snapshots = []
+  let callCount = 0
+  const service = {
+    get listCalls() { return callCount },
+    async list() {
+      callCount += 1
+      return null
+    },
+  }
+  const ctx = {
+    inject: (names, cb) => cb({ sessionPersistence: service, sessions: { get: () => undefined } }),
+    effect: (fn) => fn(),
+    logger: { info: () => {}, warn: () => {} },
+    webServer: { register: () => () => {} },
+  }
+  apply(ctx, { snapshotPath: undefined })
+  const result = await service.list()
+  assert.equal(result, null, 'null from host must pass through copy() without TypeError')
+  assert.equal(callCount, 1, 'host list must still be called')
+})
+
+test('copy: non-array primitive input returns as-is without throwing', async () => {
+  const snapshots = []
+  let callCount = 0
+  const service = {
+    get listCalls() { return callCount },
+    async list() {
+      callCount += 1
+      return 'corrupt response'
+    },
+  }
+  const ctx = {
+    inject: (names, cb) => cb({ sessionPersistence: service, sessions: { get: () => undefined } }),
+    effect: (fn) => fn(),
+    logger: { info: () => {}, warn: () => {} },
+    webServer: { register: () => () => {} },
+  }
+  apply(ctx, { snapshotPath: undefined })
+  const result = await service.list()
+  assert.equal(result, 'corrupt response', 'primitive from host must pass through copy() without TypeError')
+})
+
+test('copy: empty array is handled correctly', async () => {
+  // Use makeFake with empty ids to get a host that returns []
+  const fake = makeFake({ ids: [] })
+  apply(fake.ctx, { snapshotPath: undefined })
+  const result = await fake.list()
+  assert.deepEqual(result, [], 'empty array must be returned correctly')
+  assert.equal(fake.service.listCalls, 1)
+})
+
+// --- list() argument edge cases ------------------------------------------------
+
+test('list: null argument is forwarded to originalList', async () => {
+  const fake = makeFake()
+  apply(fake.ctx, { snapshotPath: undefined })
+  await fake.list(null)
+  assert.equal(fake.service.optionsSeen[0], null, 'null argument must be forwarded untouched')
+})
+
+test('list: undefined argument is forwarded to originalList', async () => {
+  const fake = makeFake()
+  apply(fake.ctx, { snapshotPath: undefined })
+  await fake.list()
+  assert.equal(fake.service.optionsSeen[0], undefined, 'undefined argument must be forwarded untouched')
+})
+
+// --- double apply idempotency --------------------------------------------------
+
+test('mount: double apply() is idempotent, second call is no-op', async () => {
+  const fake = makeFake()
+  apply(fake.ctx, { snapshotPath: undefined })
+  apply(fake.ctx, { snapshotPath: undefined })
+  await fake.list()
+  await fake.list()
+  assert.equal(fake.service.listCalls, 1, 'double apply must not cause double wrapping')
+})
+
+// --- session/created during in-flight scan -------------------------------------
+
+test('lifecycle: session/created during in-flight scan invalidates the scan result', async () => {
+  // When a session is created while a scan is running, the scan's result must not
+  // install into the memo (purgeEpoch prevents this).
+  const state = {
+    snapshots: [{ header: { id: 's1', cwd: '/p1', createdAt: 1 }, revision: 'r-s1', sizeBytes: 4096 }],
+  }
+  let scans = 0
+  const service = {
+    get listCalls() { return scans },
+    async list() {
+      scans += 1
+      // Small delay so create event can fire mid-scan
+      await new Promise(r => setTimeout(r, 20))
+      return state.snapshots.map(s => ({ ...s, header: { ...s.header } }))
+    },
+  }
+  const listeners = new Map()
+  const routes = []
+  const ctx = {
+    inject: (names, cb) => cb({ sessionPersistence: service, sessions: { get: () => undefined } }),
+    effect: (fn) => fn(),
+    logger: { info: () => {}, warn: () => {} },
+    on: (event, cb) => { const l = listeners.get(event) ?? []; l.push(cb); listeners.set(event, l) },
+    webServer: { register(route) { routes.push(route); return () => {} } },
+  }
+  apply(ctx, { listTtlMs: 5000, listMaxStaleMs: 120000 })
+
+  const first = service.list()
+  // Fire created event mid-scan
+  await new Promise(r => setTimeout(r, 5))
+  for (const cb of listeners.get('session/created') ?? []) cb({ id: 's2' })
+  // Add new session to state
+  state.snapshots.push({ header: { id: 's2', cwd: '/p1', createdAt: 2 }, revision: 'r-s2', sizeBytes: 2048 })
+  const result = await first
+  // The first scan started before creation, so it should still return only s1
+  // (the purgeEpoch was bumped, so the scan result won't install)
+  const ids = result.map(r => r?.header?.id)
+  assert.ok(ids.includes('s1'), 'first scan result should contain s1')
+  // Second call should trigger a fresh scan that sees s2
+  const second = await service.list()
+  const secondIds = second.map(r => r?.header?.id)
+  assert.ok(secondIds.includes('s2'), 'second scan after creation must include s2')
+})
+
+// --- dispose with invalid session object ---------------------------------------
+
+test('dispose: invalid session payload does not throw', async () => {
+  const fake = makeFake()
+  const disposeListeners = []
+  fake.ctx.on = (event, cb) => {
+    if (event === 'session/disposed') disposeListeners.push(cb)
+  }
+  apply(fake.ctx, {})
+  await fake.list()
+
+  // Various invalid payloads must not throw
+  const invalidPayloads = [null, undefined, {}, 42, 'string', { id: null }, { id: 123 }]
+  for (const payload of invalidPayloads) {
+    let threw = false
+    try {
+      for (const cb of disposeListeners) cb(payload)
+    } catch (e) {
+      threw = true
+    }
+    assert.equal(threw, false, `dispose with ${JSON.stringify(payload)} must not throw`)
+  }
+})
+
 let failed = 0
 for (const [label, fn] of tests) {
   try {
