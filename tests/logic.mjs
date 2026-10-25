@@ -734,7 +734,7 @@ test('config: invalid values fall back to defaults and the route reports them', 
   apply(fake.ctx, { listTtlMs: -5, snapshotMaxAgeMs: 'soon' })
   await fake.list()
   const m = fake.metrics()
-  assert.equal(m.config.listTtlMs, 750)
+  assert.equal(m.config.listTtlMs, 5000)
   assert.equal(m.config.snapshotMaxAgeMs, 86_400_000)
 })
 

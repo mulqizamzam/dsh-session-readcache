@@ -49,11 +49,11 @@ kali. Plugin ini tidak mengubah kode host sama sekali.
 Empat mekanisme, semuanya di `lib/index.js`:
 
 1. **Memo ber-TTL.** Hasil scan terakhir disimpan di memori. Selama TTL
-   (`listTtlMs`, default 750 ms), panggilan dilayani dari sana.
+   (`listTtlMs`, default 5000 ms), panggilan dilayani dari sana.
 2. **Penggabungan permintaan.** Panggilan yang berbarengan saat tidak ada memo
    hangat berbagi satu scan, bukan satu scan masing-masing.
 3. **Jendela stale.** Setelah TTL habis, hasil lama dikembalikan seketika
-   (`listMaxStaleMs`, default 30 detik) sementara satu scan berjalan di
+   (`listMaxStaleMs`, default 120 detik) sementara satu scan berjalan di
    belakang. Ini yang membuat balasan tetap milidetik saat pemindaian butuh
    detik-detik.
 4. **Snapshot SQLite.** Hasil scan terakhir ditulis ke satu baris SQLite, supaya
@@ -99,10 +99,10 @@ Kesegaran adalah trade-off yang disengaja, jadi batasnya ditulis eksplisit:
 
 | Keadaan | Umur paling tua yang masih dilayani |
 | --- | --- |
-| Setelah scan nyata terakhir | `listMaxStaleMs` (30 detik dengan default) |
-| Setelah seed dari snapshot saat boot | `snapshotMaxAgeMs + listTtlMs + listMaxStaleMs` (24 jam + 750 ms + 30 detik dengan default). Terukur: seed ditolak saat restart dengan jendela 10 menit karena snapshot berumur 56 menit; jendela dinaikkan ke 24 jam |
+| Setelah scan nyata terakhir | `listMaxStaleMs` (120 detik dengan default) |
+| Setelah seed dari snapshot saat boot | `snapshotMaxAgeMs + listTtlMs + listMaxStaleMs` (24 jam + 5 detik + 120 detik dengan default). Terukur: seed ditolak saat restart dengan jendela 10 menit karena snapshot berumur 56 menit; jendela dinaikkan ke 24 jam |
 | Setelah `session/disposed`, untuk baris sesi yang dibuang | Sampai penyegaran di belakang selesai pada host yang menjawab dari tracker, sama seperti sebelum C1, karena pada event dispose tracker masih memegang sesinya. Baris hilang lebih awal kalau host menjawab "tidak ada artifact-nya", dan itu yang terjadi pada host yang menjawab dari disk |
-| Setelah `session/disposed`, untuk sisa isi memo | `listMaxStaleMs` (30 detik dengan default), sampai penyegaran di belakang selesai |
+| Setelah `session/disposed`, untuk sisa isi memo | `listMaxStaleMs` (120 detik dengan default), sampai penyegaran di belakang selesai |
 
 `session/disposed` tidak lagi membuang memo; memo ditandai basi. Plugin hanya
 menanyakan host untuk baris sesi yang belum pernah ditulis ke disk, dan
@@ -138,8 +138,8 @@ oleh dispose yang sama.
 | Kunci | Default | Arti |
 | --- | --- | --- |
 | `enabled` | `true` | `false` mematikan plugin |
-| `listTtlMs` | `750` | Umur memo yang masih dianggap segar |
-| `listMaxStaleMs` | `30000` | Jendela tambahan setelah TTL habis |
+| `listTtlMs` | `5000` | Umur memo yang masih dianggap segar |
+| `listMaxStaleMs` | `120000` | Jendela tambahan setelah TTL habis |
 | `snapshotMaxAgeMs` | `86400000` | Umur snapshot yang boleh dipakai untuk boot. 24 jam, bukan 10 menit: baris hanya ditulis ulang setelah scan, jadi jeda "idle lalu restart" sering lebih panjang dari jendela pendek |
 | `snapshotPath` | turunan | Lokasi file SQLite snapshot |
 
@@ -242,7 +242,7 @@ terakhir bukan perintah yang bisa dijalankan dari repo yang dikloning.
    Batasnya: jawaban `stat()` datang asynchronous, jadi pemanggil yang datang
    sebelum jawabannya tiba masih bisa melihat barisnya; di host ini jawabannya
    datang dalam puluhan milidetik, dan memo tidak pernah dibuang selama
-   jawabannya belum tiba. Sisa memo tetap basi sampai `listMaxStaleMs` (30 detik
+   jawabannya belum tiba. Sisa memo tetap basi sampai `listMaxStaleMs` (120 detik
    dengan default), dan pemanggil berikutnya dilayani dari memori sementara
    penyegaran berjalan di belakang.
    Pada event dispose, plugin bertanya ke host apakah ARTIFAK sesi itu masih ada

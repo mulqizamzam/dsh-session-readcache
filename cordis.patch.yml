@@ -1,7 +1,7 @@
 # dsh-session-readcache — advisory cold-session read cache.
 # Mounts a late row; apply(ctx, config) wraps the shared sessionPersistence
 # instance's list() (see lib/index.js). All knobs optional; defaults in
-# lib/index.js: listTtlMs 750, listMaxStaleMs 30000, snapshotMaxAgeMs 86400000.
+# lib/index.js: listTtlMs 5000, listMaxStaleMs 120000, snapshotMaxAgeMs 86400000.
 # Set enabled: false to neutralize the row without uninstalling.
 - insert:
     - id: session-readcache

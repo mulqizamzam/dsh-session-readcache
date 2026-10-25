@@ -227,8 +227,8 @@ Semua kunci opsional. Nilai di bawah adalah default yang tertera di
 | Kunci | Default | Fungsi | Boleh 0? |
 | --- | --- | --- | --- |
 | `enabled` | `true` | `false` menonaktifkan plugin tanpa uninstall: `apply()` langsung keluar dan tidak membungkus apa pun (`lib/index.js:279-281`) | tidak, nilai selain `false` diperlakukan aktif |
-| `listTtlMs` | `750` | Selama jendela ini hasil scan `list()` dianggap segar dan dilayani sebagai hit | ya, `0` membuat memo selalu basi (`lib/index.js:56-62`) |
-| `listMaxStaleMs` | `30000` | Setelah TTL habis tapi masih di dalam jendela ini, hasil scan terakhir dikembalikan sambil refresh berjalan di belakang | ya, `0` mempertahankan perilaku TTL ketat (`lib/index.js:56-62`) |
+| `listTtlMs` | `5000` | Selama jendela ini hasil scan `list()` dianggap segar dan dilayani sebagai hit | ya, `0` membuat memo selalu basi (`lib/index.js:56-62`) |
+| `listMaxStaleMs` | `120000` | Setelah TTL habis tapi masih di dalam jendela ini, hasil scan terakhir dikembalikan sambil refresh berjalan di belakang | ya, `0` mempertahankan perilaku TTL ketat (`lib/index.js:56-62`) |
 | `snapshotMaxAgeMs` | `86400000` | Umur maksimum snapshot yang boleh mengisi memo saat boot. 24 jam, bukan 10 menit: baris hanya ditulis ulang setelah scan, jadi jeda "idle lalu restart" sering lebih panjang dari jendela pendek (bagian 7.4) | ya, `0` mematikan boot seeding (`lib/index.js:56-62`) |
 | `snapshotPath` | diturunkan | Lokasi file snapshot SQLite secara eksplisit | string kosong berarti pakai turunan (`lib/index.js:353-354`) |
 
@@ -244,8 +244,8 @@ Contoh bentuk konfigurasi, diambil dari `cordis.patch.yml`:
     - id: session-readcache
       name: dsh-session-readcache
       config:
-        listTtlMs: 750
-        listMaxStaleMs: 30000
+        listTtlMs: 5000
+        listMaxStaleMs: 120000
         snapshotMaxAgeMs: 86400000
 ```
 
@@ -442,7 +442,7 @@ Plugin memberi dua tanda bahwa ia benar-benar terpasang:
    (`lib/index.js:824-825`):
 
    ```text
-   [session-readcache] mounted (mode=list-memo, listTtlMs=750, listMaxStaleMs=30000, snapshotMaxAgeMs=86400000, snapshot=on)
+   [session-readcache] mounted (mode=list-memo, listTtlMs=5000, listMaxStaleMs=120000, snapshotMaxAgeMs=86400000, snapshot=on)
    ```
 
    Baris ini ditulis dua kali, sekali ke `process.stderr` dan sekali ke
@@ -488,7 +488,7 @@ Bentuk responsnya diambil dari handler di `lib/index.js`:
   "list": { "hits": 0, "misses": 0, "staleServed": 0 },
   "lifecycle": { "disposedInvalidations": 0, "createdInvalidations": 0, "disposeRowsRemoved": 0, "purgeDrops": 0 },
   "memo": { "warm": false, "ageMs": null, "inflight": false },
-  "config": { "listTtlMs": 750, "listMaxStaleMs": 30000, "snapshotMaxAgeMs": 86400000 },
+  "config": { "listTtlMs": 5000, "listMaxStaleMs": 120000, "snapshotMaxAgeMs": 86400000 },
   "snapshot": { "path": null, "seedResolved": false, "seeded": false, "saves": 0, "failures": 0, "notes": [] }
 }
 ```
@@ -577,9 +577,9 @@ Perilaku yang perlu diketahui:
 
 Setelah beberapa daftar sesi dibuka berulang di GUI, bentuk yang wajar adalah
 `list.misses` naik satu per scan nyata, `list.hits` naik untuk panggilan yang
-datang dalam 750 ms setelah scan, dan `list.staleServed` naik sementara
+datang dalam 5000 ms setelah scan, dan `list.staleServed` naik sementara
 `list.hits` tetap dekat nol. Itu bukan tanda kegagalan: kalau satu scan `list()`
-memakan detik, memo dengan TTL 750 ms sudah basi sebelum pemanggil yang memicunya
+memakan detik, memo dengan TTL 5000 ms sudah basi sebelum pemanggil yang memicunya
 selesai. Bentuk itu justru yang sehat pada host seperti ini, dan dijelaskan di
 komentar `listMaxStaleMs` pada `lib/index.js`.
 
@@ -1118,7 +1118,7 @@ Tiga penyebab yang bisa dijelaskan oleh kode:
 
 | Penyebab | Kenapa | Cara memastikan |
 | --- | --- | --- |
-| Interval pemanggil lebih panjang dari TTL | Satu scan memakan detik, sedangkan TTL hanya 750 ms; memo basi sebelum pemanggil berikutnya datang | Gejala yang benar justru `list.staleServed` naik |
+| Interval pemanggil lebih panjang dari TTL | Satu scan memakan detik, sedangkan TTL hanya 5000 ms; memo basi sebelum pemanggil berikutnya datang | Gejala yang benar justru `list.staleServed` naik |
 | Ada purge di antaranya | Purge sengaja membuang memo; `session/disposed` tidak lagi membuang memo, hanya menandainya basi | `lifecycle.purgeDrops` naik |
 | Mode `inert` | Service host tidak punya `list()`, jadi tidak ada yang dibungkus | `mode` di metrics bernilai `inert` |
 
@@ -1129,7 +1129,7 @@ di-key revisi `stat`.
 ### 11.6 `list.hits` selalu nol
 
 Ini bukan kegagalan. Kalau satu scan `list()` memakan waktu berdetik-detik, memo
-750 ms sudah basi sebelum pemanggil yang memicunya selesai. Gejala yang benar
+5000 ms sudah basi sebelum pemanggil yang memicunya selesai. Gejala yang benar
 adalah `list.staleServed` yang naik. Penjelasan yang sama tertulis di komentar
 `lib/index.js:23-30`, dan alasannya diukur di
 `docs/HOST-TICKET-sessionListMetadata.md`.
@@ -1490,7 +1490,7 @@ I/O adalah filesystem lokal dan SQLite lokal.
 **Kenapa `list.hits` tetap nol sementara `list.staleServed` naik?**
 
 Karena itu bentuk yang sehat pada host tempat satu scan `list()` memakan detik.
-Memo dengan TTL 750 ms sudah basi sebelum pemanggil yang memicu scan selesai. Di
+Memo dengan TTL 5000 ms sudah basi sebelum pemanggil yang memicu scan selesai. Di
 dalam jendela stale, hasil terakhir dikembalikan seketika dan satu scan berjalan di
 background. Kalau Anda ingin hit, naikkan `listTtlMs`, dengan konsekuensi bahwa
 data jadi lebih lama basi.
@@ -1500,7 +1500,7 @@ data jadi lebih lama basi.
 Hanya dalam satu hal: reply `list()` bisa sampai `listMaxStaleMs` basi setelah
 scan nyata terakhir, atau sampai `snapshotMaxAgeMs + listTtlMs + listMaxStaleMs`
 basi setelah seed dari snapshot saat boot. Dengan default yang dikirim, batas
-terburuk itu 24 jam + 750 ms + 30 detik. `session/disposed` tidak lagi membuang
+terburuk itu 24 jam + 5000 ms + 120000 ms. `session/disposed` tidak lagi membuang
 memo, dan baris sesi yang dibuang bertahan di memo sampai penyegaran di
 belakang selesai, seperti sebelum C1: pada event dispose, host masih menjawab
 "tidak ada artifact-nya" karena menjawab dari tracker in-memory. Baris hilang lebih awal kalau
