@@ -18,3 +18,16 @@
         # the row was 56 min old at boot and the seed was refused, so the first
         # reply paid a full scan.
         snapshotMaxAgeMs: 86400000
+        # Storage class preset. 'hdd' extends listTtlMs to 30s and listMaxStaleMs
+        # to 600s (10 min) to reduce scan frequency on seek-bound media. 'auto'
+        # (default) uses SSD-oriented defaults. Explicit listTtlMs/listMaxStaleMs
+        # override the preset.
+        storageMode: hdd
+        # Proactive pre-warm: trigger a background list() scan on mount so the
+        # first caller after a cold start does not pay the full scan. Off by
+        # default; enable for HDD users who keep the host running long enough
+        # for the scan to complete before opening the session list.
+        prewarmOnMount: true
+        # Delay before the pre-warm scan fires, to avoid competing with the
+        # host's own startup I/O on the same seek-bound disk. 0 = immediate.
+        prewarmDelayMs: 5000

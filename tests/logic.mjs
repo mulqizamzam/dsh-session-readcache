@@ -1144,6 +1144,144 @@ test('purge: POST handler registers sessionIds into deletedSessions', async () =
   assert.equal(data.registeredDeleted, 2, 'two session ids registered')
 })
 
+// --- HDD-specific features: storageMode, prewarm, WAL mode -------------------
+
+test('config: storageMode hdd extends TTL and stale windows from preset', async () => {
+  const fake = makeFake()
+  apply(fake.ctx, { storageMode: 'hdd' })
+  await fake.list()
+  const m = fake.metrics()
+  assert.equal(m.config.storageMode, 'hdd')
+  assert.equal(m.config.listTtlMs, 30_000, 'hdd preset sets listTtlMs to 30s')
+  assert.equal(m.config.listMaxStaleMs, 600_000, 'hdd preset sets listMaxStaleMs to 600s')
+})
+
+test('config: explicit TTL overrides hdd preset', async () => {
+  const fake = makeFake()
+  apply(fake.ctx, { storageMode: 'hdd', listTtlMs: 10_000, listMaxStaleMs: 30_000 })
+  await fake.list()
+  const m = fake.metrics()
+  assert.equal(m.config.listTtlMs, 10_000, 'explicit listTtlMs overrides preset')
+  assert.equal(m.config.listMaxStaleMs, 30_000, 'explicit listMaxStaleMs overrides preset')
+  assert.equal(m.config.storageMode, 'hdd')
+})
+
+test('config: storageMode invalid falls back to auto defaults', async () => {
+  const fake = makeFake()
+  apply(fake.ctx, { storageMode: 'magnetic' })
+  await fake.list()
+  const m = fake.metrics()
+  assert.equal(m.config.storageMode, 'auto', 'invalid storageMode falls back to auto')
+  assert.equal(m.config.listTtlMs, 5_000, 'falls back to auto preset TTL')
+  assert.equal(m.config.listMaxStaleMs, 120_000, 'falls back to auto preset stale')
+})
+
+test('config: storageMode ssd matches auto defaults', async () => {
+  const fake = makeFake()
+  apply(fake.ctx, { storageMode: 'ssd' })
+  await fake.list()
+  const m = fake.metrics()
+  assert.equal(m.config.storageMode, 'ssd')
+  assert.equal(m.config.listTtlMs, 5_000)
+  assert.equal(m.config.listMaxStaleMs, 120_000)
+})
+
+test('prewarm: on mount with prewarmOnMount=true triggers a background scan', async () => {
+  const fake = makeFake({ listDelayMs: 50 })
+  apply(fake.ctx, { prewarmOnMount: true, snapshotPath: undefined })
+  // Give the pre-warm time to start and partially run
+  await settle(80)
+  const m = fake.metrics()
+  assert.equal(m.prewarm.enabled, true)
+  assert.equal(m.prewarm.triggered, 1, 'prewarm was triggered on mount')
+  // The scan should have completed by now (listDelayMs=50 < wait=80)
+  assert.ok(m.memo.warm || m.prewarm.completed === 1, 'prewarm scan completed or memo is warm')
+})
+
+test('prewarm: with prewarmOnMount=false no background scan fires', async () => {
+  const fake = makeFake({ listDelayMs: 10 })
+  apply(fake.ctx, { prewarmOnMount: false, snapshotPath: undefined })
+  await settle(50)
+  const m = fake.metrics()
+  assert.equal(m.prewarm.enabled, false)
+  assert.equal(m.prewarm.triggered, 0, 'no prewarm triggered when disabled')
+  assert.equal(fake.service.listCalls, 0, 'no scan fired without explicit list() call')
+})
+
+test('prewarm: inert mode (no list) does not trigger prewarm', async () => {
+  const fake = makeFake()
+  fake.service.list = undefined
+  apply(fake.ctx, { prewarmOnMount: true })
+  await settle(50)
+  const m = fake.metrics()
+  assert.equal(m.prewarm.enabled, true)
+  assert.equal(m.prewarm.triggered, 0, 'inert mode: no prewarm triggered because no originalList')
+})
+
+test('prewarm: delay defers the scan until the delay elapses', async () => {
+  // triggered is set when the mount code runs (the schedule is recorded);
+  // the actual list() call is deferred by prewarmDelayMs. We verify that
+  // the host list() does NOT fire before the delay and DOES fire after.
+  const fake = makeFake({ listDelayMs: 20 })
+  apply(fake.ctx, { prewarmOnMount: true, prewarmDelayMs: 60, snapshotPath: undefined })
+  // triggered records the schedule, not the execution
+  assert.equal(fake.metrics().prewarm.triggered, 1, 'schedule is recorded on mount')
+  // No scan has run yet (delay not elapsed)
+  assert.equal(fake.service.listCalls, 0, 'no scan before delay elapses')
+  // Wait for the delay + scan to complete
+  await settle(100)
+  assert.equal(fake.service.listCalls, 1, 'scan fired after delay')
+  assert.equal(fake.metrics().prewarm.completed, 1, 'prewarm completed')
+})
+
+test('prewarm: metrics include prewarm field with correct shape', async () => {
+  const fake = makeFake()
+  apply(fake.ctx, { prewarmOnMount: true, prewarmDelayMs: 0, storageMode: 'hdd', snapshotPath: undefined })
+  const m = fake.metrics()
+  assert.ok('enabled' in m.prewarm)
+  assert.ok('triggered' in m.prewarm)
+  assert.ok('completed' in m.prewarm)
+  assert.ok('delayMs' in m.prewarm)
+  assert.equal(m.config.storageMode, 'hdd')
+})
+
+test('wal: snapshot database uses WAL journal mode after save', async () => {
+  const fake = makeFake()
+  const snapshotPath = join(fake.dir, 'snap.db')
+  apply(fake.ctx, { snapshotPath })
+  await fake.list()
+  // Wait for the background snapshot write to land
+  await settle(60)
+  // Read the journal_mode directly from the database
+  const Database = createRequire(import.meta.url)('better-sqlite3')
+  const db = new Database(snapshotPath, { readonly: false })
+  try {
+    const mode = db.pragma('journal_mode', { simple: true })
+    assert.equal(mode, 'wal', 'snapshot database must use WAL journal mode')
+  } finally {
+    db.close()
+  }
+})
+
+test('wal: read-only open still works on a WAL-mode database', async () => {
+  const fake = makeFake()
+  const snapshotPath = join(fake.dir, 'snap2.db')
+  // First write a snapshot normally (which enables WAL)
+  apply(fake.ctx, { snapshotPath })
+  await fake.list()
+  await settle(60)
+  // Now open it read-only and verify we can read it
+  const Database = createRequire(import.meta.url)('better-sqlite3')
+  const db = new Database(snapshotPath, { readonly: true, fileMustExist: true })
+  try {
+    const row = db.prepare('SELECT saved_at, headers FROM readcache_list_snapshot WHERE id = 1').get()
+    assert.ok(row !== undefined, 'read-only open succeeds on WAL-mode db')
+    assert.ok(Array.isArray(JSON.parse(row.headers)))
+  } finally {
+    db.close()
+  }
+})
+
 let failed = 0
 for (const [label, fn] of tests) {
   try {

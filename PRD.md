@@ -142,11 +142,18 @@ oleh dispose yang sama.
 | `listMaxStaleMs` | `120000` | Jendela tambahan setelah TTL habis |
 | `snapshotMaxAgeMs` | `86400000` | Umur snapshot yang boleh dipakai untuk boot. 24 jam, bukan 10 menit: baris hanya ditulis ulang setelah scan, jadi jeda "idle lalu restart" sering lebih panjang dari jendela pendek |
 | `snapshotPath` | turunan | Lokasi file SQLite snapshot |
+| `storageMode` | `auto` | Preset kelas penyimpanan. `hdd` memperpanjang TTL ke 30s dan stale window ke 600s untuk mengurangi frekuensi scan pada media rotational. `auto`/`ssd` memakai default. Nilai tidak dikenal jatuh ke `auto`. TTL/stale eksplisit menimpa preset. |
+| `prewarmOnMount` | `false` | bila `true`, scan background `list()` dijalankan segera setelah mount agar pemanggil pertama setelah cold start tidak membayar biaya scan penuh. `inert` mode (host tanpa `list()`) tidak memicu pre-warm. |
+| `prewarmDelayMs` | `0` | delay sebelum pre-warm scan dimulai, menghindari kontensi I/O dengan inisialisasi host. `0` = langsung via `setImmediate`. |
 
 **Endpoint HTTP** (dipasang di web server host):
 
-- `GET /plugin/session-readcache/metrics` mengembalikan penghitung, konfigurasi efektif, dan alasan kegagalan snapshot.
+- `GET /plugin/session-readcache/metrics` mengembalikan penghitung, konfigurasi efektif, status pre-warm, dan alasan kegagalan snapshot.
 - `POST /plugin/session-readcache/purge` membuang memo. Metode lain dijawab `405`.
+
+**Snapshot database**: tabel `readcache_list_snapshot` disimpan dalam mode **WAL** (`journal_mode = WAL`). Mode ini mengurangi biaya tulis snapshot pada HDD dari beberapa fsync random-seek menjadi append sekuelensial tunggal, dan menjaga jalur baca tidak terblokir selama write background.
+
+**Pre-warm lifecycle**: `prewarm.triggered` mencatat jadwal pre-warm saat mount; `prewarm.completed` naik setelah scan selesai. Scan dijadwalkan via `refreshListInBackground()` yang memanfaatkan jalur stale-while-revalidate yang sudah ada: kalau snapshot sudah mengisi memo, pre-warm adalah no-op.
 
 ## 8. Di luar lingkup
 

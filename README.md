@@ -231,6 +231,9 @@ Semua kunci opsional. Nilai di bawah adalah default yang tertera di
 | `listMaxStaleMs` | `120000` | Setelah TTL habis tapi masih di dalam jendela ini, hasil scan terakhir dikembalikan sambil refresh berjalan di belakang | ya, `0` mempertahankan perilaku TTL ketat (`lib/index.js:56-62`) |
 | `snapshotMaxAgeMs` | `86400000` | Umur maksimum snapshot yang boleh mengisi memo saat boot. 24 jam, bukan 10 menit: baris hanya ditulis ulang setelah scan, jadi jeda "idle lalu restart" sering lebih panjang dari jendela pendek (bagian 7.4) | ya, `0` mematikan boot seeding (`lib/index.js:56-62`) |
 | `snapshotPath` | diturunkan | Lokasi file snapshot SQLite secara eksplisit | string kosong berarti pakai turunan (`lib/index.js:353-354`) |
+| `storageMode` | `auto` | Preset penyimpanan: `auto`/`ssd` memakai default TTL/stale; `hdd` memperpanjang `listTtlMs` ke 30s dan `listMaxStaleMs` ke 600s untuk mengurangi frekuensi scan pada media rotational. Nilai tidak dikenal jatuh ke `auto`. TTL/stale eksplisit menimpa preset. | ya, nilai tidak valid dilaporkan di log dan diabaikan |
+| `prewarmOnMount` | `false` | Bila `true`, scan background `list()` dijalankan segera setelah mount agar pemanggil pertama setelah restart tidak membayar biaya scan penuh (terukur 12,9s median SSD, 77,7s cold page cache, dan lebih lama pada HDD). Scan berjalan lewat jalur stale-while-revalidate yang sudah ada: kalau snapshot sudah mengisi memo, pre-warm adalah no-op; kalau tidak, scan nyata berjalan di background sambil host menyelesaikan boot. | tidak, hanya `true` mengaktifkan |
+| `prewarmDelayMs` | `0` | Delay sebelum pre-warm scan dimulai, supaya tidak berebut bandwidth I/O dengan inisialisasi host sendiri pada disk yang sama. `0` berarti kebakaran segera lewat `setImmediate`. | ya, `0` berarti langsung |
 
 Kunci `maxEntries` dan `maxTotalEvents` dihapus pada 2026-10-21. Keduanya sisa
 dari cache `inspect` per sesi yang sudah dihapus bersama host `0.2.0-rc.2`, dan
@@ -486,9 +489,10 @@ Bentuk responsnya diambil dari handler di `lib/index.js`:
 {
   "mode": "list-memo",
   "list": { "hits": 0, "misses": 0, "staleServed": 0 },
-  "lifecycle": { "disposedInvalidations": 0, "createdInvalidations": 0, "disposeRowsRemoved": 0, "purgeDrops": 0 },
+  "lifecycle": { "disposedInvalidations": 0, "createdInvalidations": 0, "disposeRowsRemoved": 0, "purgeDrops": 0, "deletedSessionsCount": 0 },
   "memo": { "warm": false, "ageMs": null, "inflight": false },
-  "config": { "listTtlMs": 5000, "listMaxStaleMs": 120000, "snapshotMaxAgeMs": 86400000 },
+  "config": { "listTtlMs": 5000, "listMaxStaleMs": 120000, "snapshotMaxAgeMs": 86400000, "storageMode": "auto", "prewarmOnMount": false, "prewarmDelayMs": 0 },
+  "prewarm": { "enabled": false, "triggered": 0, "completed": 0, "delayMs": 0 },
   "snapshot": { "path": null, "seedResolved": false, "seeded": false, "saves": 0, "failures": 0, "notes": [] }
 }
 ```
@@ -520,6 +524,11 @@ Arti setiap field:
 | `snapshot.saves` | Snapshot yang berhasil ditulis | Setiap penulisan row yang sukses |
 | `snapshot.failures` | Snapshot yang gagal dibaca atau ditulis | Setiap penolakan: rusak, versi skema asing, terlalu besar, terlalu tua, `saved_at` di masa depan, gagal tulis |
 | `snapshot.notes` | Buffer masalah terakhir plugin. Dua jenis teks: alasan persistensi snapshot tidak bekerja, dan baris `dispose: stat failed for <id>: <alasan>` ketika host tidak bisa ditanya apakah sesi yang dibuang masih punya artifact di disk. Bentuk kedua punya dua varian: pesan error aslinya, atau `the answer could not be applied` kalau jawabannya tidak bisa dipakai. Tidak ada catatan untuk host yang memang tidak punya method `stat`, karena itu bukan kegagalan. Nama field-nya historis: isinya bukan cuma soal snapshot | Maksimal 5 catatan terakhir (`lib/index.js:750`). Catatan dispose berarti baris sesi yang dibuang bisa jadi masih basi, jadi operator bisa melihatnya |
+| `prewarm.enabled` | Apakah pre-warm dikonfigurasi | `true` saat `prewarmOnMount` di-set |
+| `prewarm.triggered` | Apakah pre-warm dijadwalkan pada mount | `1` saat mount kode menjalankan; tidak menunggu timer. `0` kalau `prewarmOnMount` false atau host tanpa `list()` |
+| `prewarm.completed` | Apakah scan pre-warm berhasil mengisi memo | `1` setelah scan selesai; `0` kalau masih berjalan atau belum dijadwalkan |
+| `prewarm.delayMs` | Delay yang dikonfigurasi untuk pre-warm | Nilai `prewarmDelayMs` |
+| `config.storageMode` | Kelas penyimpanan yang aktif (setelah validasi) | `auto`, `ssd`, atau `hdd`; nilai tidak valid dilaporkan dan jatuh ke `auto` |
 
 Penghitung direset setiap restart, karena mereka hidup di dalam closure `apply()`
 (`lib/index.js:307`) dan bukan di penyimpanan.
