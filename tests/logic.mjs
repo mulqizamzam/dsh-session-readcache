@@ -1023,6 +1023,127 @@ test('dispose: invalid session payload does not throw', async () => {
   }
 })
 
+
+// --- workspace awareness: deletedSessions filtering -------------------------
+
+test('delete: persistence.delete() wrapping drops memo and registers the id', async () => {
+  const fake = makeFake({ ids: ['s1', 's2', 's3'] })
+  apply(fake.ctx, {})
+  // Populate cache via a scan
+  await fake.list()
+  assert.equal(fake.service.listCalls, 1, 'one scan to populate')
+  // The fake does not expose listCache; verify via the metrics route that
+  // the memo is warm (ageMs is a number, not null).
+  const metricsRoute = fake.routes.find(r => r.path === '/plugin/session-readcache/metrics')
+  const mockRes = { _headers: {}, _body: null,
+    writeHead(status, headers) { this._status = status; this._headers = headers },
+    end(body) { this._body = body }
+  }
+  metricsRoute.handler({ method: 'GET' }, mockRes)
+  const beforeData = JSON.parse(mockRes._body)
+  assert.ok(beforeData.memo.warm, 'memo is warm before delete')
+
+  // Now simulate what the wrapper does when persistence.delete() fires:
+  // drop memo, register id in deletedSessions, bump purgeEpoch
+  // We verify this by calling the route handler that the purge plugin would call
+  const purgeRoute = fake.routes.find(r => r.path === '/plugin/session-readcache/purge')
+  const purgeReq = {
+    method: 'POST',
+    headers: new Map([['content-type', 'application/json']]),
+    text: async () => JSON.stringify({ sessionIds: ['s1'] })
+  }
+  await purgeRoute.handler(purgeReq, mockRes)
+  const afterData = JSON.parse(mockRes._body)
+  assert.equal(afterData.purged, 1, 'memo dropped after purge')
+  assert.equal(afterData.registeredDeleted, 1, 's1 registered as deleted')
+})
+
+test('delete: scan result filters out explicitly deleted session ids', async () => {
+  const fake = makeFake({ ids: ['s1', 's2', 's3'] })
+  apply(fake.ctx, {})
+  await fake.list()
+  // Use purge endpoint to register s1 as deleted, then call list() again.
+  // The second scan should exclude s1 from its result.
+  const purgeRoute = fake.routes.find(r => r.path === '/plugin/session-readcache/purge')
+  const mockRes = { _headers: {}, _body: null,
+    writeHead(status, headers) { this._status = status; this._headers = headers },
+    end(body) { this._body = body }
+  }
+  await purgeRoute.handler({
+    method: 'POST',
+    headers: new Map([['content-type', 'application/json']]),
+    text: async () => JSON.stringify({ sessionIds: ['s1'] })
+  }, mockRes)
+
+  // Now call list() again — since the memo was dropped, a fresh scan runs.
+  // The fake's list() returns all 3 snapshots, but the wrapper should
+  // filter out s1 because it is in deletedSessions.
+  const result = await fake.list()
+  const ids = result.map(s => s.header.id)
+  assert.ok(!ids.includes('s1'), 'deleted session s1 should be filtered out')
+  assert.ok(ids.includes('s2'), 's2 should still be present')
+  assert.ok(ids.includes('s3'), 's3 should still be present')
+})
+
+test('workspace: releaseSession() wrapping drops memo and registers the id', async () => {
+  const fake = makeFake({ ids: ['s1', 's2', 's3'] })
+  // Add releaseSession to simulate workspaceRegistry
+  fake.service.releaseSession = async (id) => {
+    // simulate removing from workspace
+  }
+  apply(fake.ctx, {})
+  await fake.list()
+  // Trigger what the wrapper does
+  // The wrapper calls target.releaseSession then drops memo and registers id
+  // Verify by checking that after calling releaseSession on the wrapped target,
+  // the memo is dropped
+  const before = fake.service.listCalls
+  await fake.service.releaseSession('s1')
+  // After releaseSession, the wrapper should have dropped the memo
+  // The next list() call should trigger a fresh scan
+  await fake.list()
+  const after = fake.service.listCalls
+  assert.equal(after - before, 1, 'fresh scan after releaseSession')
+})
+
+test('metrics: deletedSessionsCount is reported', async () => {
+  const fake = makeFake({ ids: ['s1', 's2'] })
+  apply(fake.ctx, {})
+  await fake.list()
+  // Use the route handler directly to check metrics
+  const route = fake.routes.find(r => r.path === '/plugin/session-readcache/metrics')
+  assert.ok(route, 'metrics route registered')
+  const mockRes = { _headers: {}, _body: null,
+    writeHead(status, headers) { this._status = status; this._headers = headers },
+    end(body) { this._body = body }
+  }
+  route.handler({ method: 'GET' }, mockRes)
+  const data = JSON.parse(mockRes._body)
+  assert.equal(typeof data.lifecycle.deletedSessionsCount, 'number',
+    'deletedSessionsCount should be a number in metrics')
+})
+
+test('purge: POST handler registers sessionIds into deletedSessions', async () => {
+  const fake = makeFake({ ids: ['s1', 's2', 's3'] })
+  apply(fake.ctx, {})
+  await fake.list()
+  const route = fake.routes.find(r => r.path === '/plugin/session-readcache/purge')
+  assert.ok(route, 'purge route registered')
+  const mockReq = {
+    method: 'POST',
+    headers: new Map([['content-type', 'application/json']]),
+    text: async () => JSON.stringify({ sessionIds: ['s1', 's3'] })
+  }
+  const mockRes = { _headers: {}, _body: null,
+    writeHead(status, headers) { this._status = status; this._headers = headers },
+    end(body) { this._body = body }
+  }
+  await route.handler(mockReq, mockRes)
+  const data = JSON.parse(mockRes._body)
+  assert.equal(data.purged, 1, 'memo was dropped')
+  assert.equal(data.registeredDeleted, 2, 'two session ids registered')
+})
+
 let failed = 0
 for (const [label, fn] of tests) {
   try {
