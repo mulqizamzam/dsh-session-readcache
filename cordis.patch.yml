@@ -31,3 +31,6 @@
         # Delay before the pre-warm scan fires, to avoid competing with the
         # host's own startup I/O on the same seek-bound disk. 0 = immediate.
         prewarmDelayMs: 5000
+        # Parallel scan mode: bypasses sequential host list() with 16 concurrent
+        # I/O workers. Reduces 59s cold scan to ~2s. Disable with false.
+        parallelScan: true
