@@ -32,7 +32,5 @@
       "dsh": ">=0.1.1-rc.1"
     }
   },
-  "dependencies": {
-    "better-sqlite3": "13.0.3"
-  }
+  "dependencies": {}
 }
