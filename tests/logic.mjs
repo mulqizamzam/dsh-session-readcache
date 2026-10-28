@@ -1282,6 +1282,21 @@ test('wal: read-only open still works on a WAL-mode database', async () => {
   }
 })
 
+
+// --- parallel scan ----------------------------------------------------------------
+
+test('parallel scan: config accepted and reported in metrics', async () => {
+  const fake = makeFake()
+  apply(fake.ctx, { parallelScan: true })
+  // Just check metrics without calling list() to avoid parallel scan
+  assert.equal(fake.metrics().config.parallelScan, true, 'parallelScan should be true')
+})
+test('parallel scan: defaults to false', async () => {
+  const fake = makeFake()
+  apply(fake.ctx, {})
+  await fake.list()
+  assert.equal(fake.metrics().config.parallelScan, false, 'parallelScan defaults to false')
+})
 let failed = 0
 for (const [label, fn] of tests) {
   try {
