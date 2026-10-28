@@ -4,6 +4,18 @@ import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { createRequire } from 'node:module'
 import { apply, clock as libClock } from '../lib/index.js'
+import { DatabaseSync } from 'node:sqlite'
+
+/** Open a snapshot database with the builtin SQLite. */
+function openSqlite(path, readOnly) {
+  return readOnly ? new DatabaseSync(path, { readonly: true }) : new DatabaseSync(path)
+}
+
+/** Read one PRAGMA value as a primitive. */
+function pragmaValue(db, name) {
+  const row = db.prepare(`PRAGMA ${name}`).get()
+  return row ? row[name] : undefined
+}
 
 /**
  * Read the snapshot row straight out of the file, or undefined when the file or
@@ -11,9 +23,7 @@ import { apply, clock as libClock } from '../lib/index.js'
  */
 function dbRow(snapshotPath) {
   if (!existsSync(snapshotPath)) return undefined
-  const require = createRequire(import.meta.url)
-  const Database = require('better-sqlite3')
-  const db = new Database(snapshotPath, { readonly: true, fileMustExist: true })
+  const db = openSqlite(snapshotPath, true)
   try {
     return db.prepare('SELECT saved_at, headers FROM readcache_list_snapshot WHERE id = 1').get()
   } catch {
@@ -144,8 +154,7 @@ function test(label, fn) { tests.push([label, fn]) }
 delete process.env.DSH_HOME
 
 function plantSnapshot(snapshotPath, headers, savedAt = Date.now()) {
-  const Database = createRequire(import.meta.url)('better-sqlite3')
-  const db = new Database(snapshotPath)
+  const db = openSqlite(snapshotPath)
   db.exec(`CREATE TABLE IF NOT EXISTS readcache_list_snapshot (
     id INTEGER PRIMARY KEY CHECK (id = 1), saved_at INTEGER NOT NULL, headers TEXT NOT NULL)`)
   db.prepare('INSERT OR REPLACE INTO readcache_list_snapshot VALUES (1, ?, ?)').run(savedAt, JSON.stringify(headers))
@@ -153,13 +162,12 @@ function plantSnapshot(snapshotPath, headers, savedAt = Date.now()) {
 }
 
 function plantRawSnapshot(snapshotPath, { headers, savedAt = Date.now(), userVersion }) {
-  const Database = createRequire(import.meta.url)('better-sqlite3')
-  const db = new Database(snapshotPath)
+  const db = openSqlite(snapshotPath)
   db.exec(`CREATE TABLE IF NOT EXISTS readcache_list_snapshot (
     id INTEGER PRIMARY KEY CHECK (id = 1), saved_at INTEGER NOT NULL, headers TEXT NOT NULL)`)
   db.prepare('INSERT OR REPLACE INTO readcache_list_snapshot VALUES (1, ?, ?)')
     .run(savedAt, typeof headers === 'string' ? headers : JSON.stringify(headers))
-  if (userVersion !== undefined) db.pragma(`user_version = ${userVersion}`)
+  if (userVersion !== undefined) db.exec(`PRAGMA user_version = ${userVersion}`)
   db.close()
 }
 
@@ -1253,10 +1261,9 @@ test('wal: snapshot database uses WAL journal mode after save', async () => {
   // Wait for the background snapshot write to land
   await settle(60)
   // Read the journal_mode directly from the database
-  const Database = createRequire(import.meta.url)('better-sqlite3')
-  const db = new Database(snapshotPath, { readonly: false })
+  const db = openSqlite(snapshotPath)
   try {
-    const mode = db.pragma('journal_mode', { simple: true })
+    const mode = pragmaValue(db, 'journal_mode')
     assert.equal(mode, 'wal', 'snapshot database must use WAL journal mode')
   } finally {
     db.close()
@@ -1271,8 +1278,7 @@ test('wal: read-only open still works on a WAL-mode database', async () => {
   await fake.list()
   await settle(60)
   // Now open it read-only and verify we can read it
-  const Database = createRequire(import.meta.url)('better-sqlite3')
-  const db = new Database(snapshotPath, { readonly: true, fileMustExist: true })
+  const db = openSqlite(snapshotPath, true)
   try {
     const row = db.prepare('SELECT saved_at, headers FROM readcache_list_snapshot WHERE id = 1').get()
     assert.ok(row !== undefined, 'read-only open succeeds on WAL-mode db')
